@@ -656,12 +656,12 @@ async def cb_menu(callback: CallbackQuery, bot: Bot) -> None:
         await callback.answer()
         return
     try:
-        await bot.edit_reply_markup(
+        await bot.edit_message_reply_markup(
             chat_id=chat_id, message_id=message_id, reply_markup=_keyboard(entry.settings, view)
         )
     except TelegramBadRequest as exc:
         if "not modified" not in str(exc).lower():
-            logger.warning("edit_reply_markup не удался: %s", exc)
+            logger.warning("edit_message_reply_markup не удался: %s", exc)
             await callback.answer(TEXT_ERROR, show_alert=True)
             return
     store.put(chat_id, message_id, entry.source, entry.settings, custom_palette=entry.custom_palette, view=view)
@@ -729,7 +729,7 @@ async def cb_export(callback: CallbackQuery, bot: Bot) -> None:
         settings = replace(entry.settings, sticker=not entry.settings.sticker)
         store.put(chat_id, message_id, entry.source, settings,
                   custom_palette=entry.custom_palette, view=entry.view)
-        await bot.edit_reply_markup(
+        await bot.edit_message_reply_markup(
             chat_id=chat_id, message_id=message_id,
             reply_markup=_keyboard(settings, entry.view),
         )
