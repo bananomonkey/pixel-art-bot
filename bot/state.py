@@ -8,6 +8,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 
+from .config import DEFAULT_CONTRAST, DEFAULT_SATURATION, DEFAULT_SHARPNESS
+
 # --- уровни размера пикселя: сетка по большей стороне ---
 SIZE_ORDER: tuple[str, ...] = ("small", "medium", "large", "huge")
 SIZE_LABELS: dict[str, str] = {
@@ -26,9 +28,12 @@ class Settings:
     """Настройки пиксель-арта для одного фото."""
 
     pixel_size: str = "medium"  # small | medium | large | huge
-    palette: str = "auto"  # auto | gameboy | nes | pico8 | c64 | bw | cga
+    palette: str = "auto"  # auto | gameboy | nes | pico8 | c64 | bw | cga | custom
     n_colors: int = 16  # только для «Авто», одно из COLOR_STEPS
     dither: bool = False
+    contrast: float = DEFAULT_CONTRAST
+    saturation: float = DEFAULT_SATURATION
+    sharpness: float = DEFAULT_SHARPNESS
 
 
 def with_changes(settings: Settings, **changes) -> Settings:
@@ -38,11 +43,16 @@ def with_changes(settings: Settings, **changes) -> Settings:
 
 @dataclass
 class Entry:
-    """Запись состояния: подготовленный исходник + текущие настройки."""
+    """Запись состояния: подготовленный исходник + текущие настройки.
+
+    custom_palette — снимок своей палитры автора (нужен для перерисовки
+    кнопками, если автор выбрал режим «Свои»).
+    """
 
     source: bytes  # исходник, уменьшенный и сжатый (JPEG), только в памяти
     settings: Settings
     updated_at: float
+    custom_palette: tuple | None = None
 
 
 class StateStore:
@@ -57,12 +67,24 @@ class StateStore:
         self._ttl_seconds = ttl_seconds
         self._entries: "OrderedDict[tuple[int, int], Entry]" = OrderedDict()
 
-    def put(self, chat_id: int, message_id: int, source: bytes, settings: Settings) -> None:
+    def put(
+        self,
+        chat_id: int,
+        message_id: int,
+        source: bytes,
+        settings: Settings,
+        custom_palette: tuple | None = None,
+    ) -> None:
         """Сохранить/обновить запись и поднять её наверх LRU."""
         key = (chat_id, message_id)
         if key in self._entries:
             self._entries.move_to_end(key)
-        self._entries[key] = Entry(source=source, settings=settings, updated_at=time.monotonic())
+        self._entries[key] = Entry(
+            source=source,
+            settings=settings,
+            updated_at=time.monotonic(),
+            custom_palette=custom_palette,
+        )
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)  # вытеснить наименее давнюю
 
@@ -100,18 +122,18 @@ class ChatsRegistry:
     """LRU-реестр чатов, которые общались с ботом (для рассылок админом).
 
     Только в памяти процесса: после перезапуска реестр пуст.
-    chat_id хранится без содержимого переписки.
+    Хранится только chat_id и время последней активности, без содержимого.
     """
 
     def __init__(self, max_entries: int = 10_000):
         self._max_entries = max_entries
-        self._chats: "OrderedDict[int, None]" = OrderedDict()
+        self._chats: "OrderedDict[int, float]" = OrderedDict()  # chat_id -> время (unix)
 
-    def touch(self, chat_id: int) -> None:
+    def touch(self, chat_id: int, now: float | None = None) -> None:
         """Отметить чат как активный (поднимает его наверх LRU)."""
         if chat_id in self._chats:
             self._chats.move_to_end(chat_id)
-        self._chats[chat_id] = None
+        self._chats[chat_id] = time.time() if now is None else now
         while len(self._chats) > self._max_entries:
             self._chats.popitem(last=False)
 
@@ -123,5 +145,37 @@ class ChatsRegistry:
         """Список активных чатов."""
         return list(self._chats.keys())
 
+    def recent_ids(self, now: float, days: float) -> list[int]:
+        """Чаты, активные за последние days суток."""
+        cutoff = now - days * 86400.0
+        return [chat_id for chat_id, ts in self._chats.items() if ts >= cutoff]
+
     def __len__(self) -> int:
         return len(self._chats)
+
+
+class PerUserStore:
+    """LRU-словарь user_id -> значение (любимые стили, свои палитры и т.п.)."""
+
+    def __init__(self, max_entries: int = 2000):
+        self._max_entries = max_entries
+        self._items: "OrderedDict[int, object]" = OrderedDict()
+
+    def put(self, user_id: int, value) -> None:
+        if user_id in self._items:
+            self._items.move_to_end(user_id)
+        self._items[user_id] = value
+        while len(self._items) > self._max_entries:
+            self._items.popitem(last=False)
+
+    def get(self, user_id: int):
+        value = self._items.get(user_id)
+        if value is not None:
+            self._items.move_to_end(user_id)
+        return value
+
+    def drop(self, user_id: int) -> None:
+        self._items.pop(user_id, None)
+
+    def __len__(self) -> int:
+        return len(self._items)

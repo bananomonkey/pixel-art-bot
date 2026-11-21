@@ -59,6 +59,7 @@ class Broadcast:
     interval: float  # секунды: задержка для once, период для cycle
     next_run: float  # время следующей отправки (time.monotonic)
     sent_total: int = 0
+    target_days: float | None = None  # «активным за N дней» — фильтр чатов
 
 
 class BroadcastStore:
@@ -76,6 +77,7 @@ class BroadcastStore:
         mode: str,
         interval: float,
         now: float,
+        target_days: float | None = None,
     ) -> Broadcast | None:
         """Создать рассылку; None, если достигнут лимит активных."""
         if mode not in ("once", "cycle") or len(self._items) >= self._max_active:
@@ -87,6 +89,7 @@ class BroadcastStore:
             mode=mode,
             interval=interval,
             next_run=now + interval,
+            target_days=target_days,
         )
         self._next_id += 1
         self._items[item.id] = item
@@ -109,3 +112,57 @@ class BroadcastStore:
 
     def __len__(self) -> int:
         return len(self._items)
+
+
+# ---------------------------------------------------------------- шаблоны постов
+
+
+@dataclass
+class Template:
+    """Сохранённый пост админа: можно отправить сейчас одним нажатием."""
+
+    id: int
+    chat_id: int
+    message_id: int
+    created_at: float
+
+
+class TemplateStore:
+    """Шаблоны рассылок в памяти (без содержимого — только ссылка на пост)."""
+
+    def __init__(self, max_items: int = 20):
+        self._max_items = max_items
+        self._next_id = 1
+        self._items: dict[int, Template] = {}
+
+    def add(self, chat_id: int, message_id: int, now: float) -> Template | None:
+        if len(self._items) >= self._max_items:
+            return None
+        item = Template(id=self._next_id, chat_id=chat_id, message_id=message_id, created_at=now)
+        self._next_id += 1
+        self._items[item.id] = item
+        return item
+
+    def remove(self, template_id: int) -> bool:
+        return self._items.pop(template_id, None) is not None
+
+    def get(self, template_id: int) -> Template | None:
+        return self._items.get(template_id)
+
+    def get_all(self) -> list[Template]:
+        return sorted(self._items.values(), key=lambda t: t.id)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+
+def parse_target_days(text: str) -> float | None:
+    """«7» -> 7.0 (дней активности для целевой рассылки); None если неверно."""
+    cleaned = (text or "").strip()
+    if not cleaned.isdigit() or int(cleaned) < 1:
+        return None
+    from .config import TARGETED_MAX_DAYS
+
+    if int(cleaned) > TARGETED_MAX_DAYS:
+        return None
+    return float(int(cleaned))

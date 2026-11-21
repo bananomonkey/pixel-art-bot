@@ -8,9 +8,17 @@ import io
 import math
 
 import numpy as np
-from PIL import Image, ImageEnhance, ImageOps
+from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 
-from .config import MAX_IMAGE_SIDE, RESULT_MAX_SIDE, SOURCE_MAX_SIDE, STORAGE_JPEG_QUALITY
+from .config import (
+    DEFAULT_CONTRAST,
+    DEFAULT_SATURATION,
+    DEFAULT_SHARPNESS,
+    MAX_IMAGE_SIDE,
+    RESULT_MAX_SIDE,
+    SOURCE_MAX_SIDE,
+    STORAGE_JPEG_QUALITY,
+)
 from .palettes import FIXED_PALETTES, as_numpy
 from .state import Settings
 
@@ -93,15 +101,22 @@ def make_pixel_art(
     palette: str = "auto",
     n_colors: int = 16,
     dither: bool = False,
+    contrast: float = DEFAULT_CONTRAST,
+    saturation: float = DEFAULT_SATURATION,
+    sharpness: float = DEFAULT_SHARPNESS,
+    palette_colors: tuple | None = None,
 ) -> Image.Image:
     """Пикселизация RGB-изображения: сетка -> квантизация -> ровные квадраты.
 
     Возвращает RGB-изображение, большая сторона которого — целое кратное
-    размера сетки и близка к RESULT_MAX_SIDE.
+    размера сетки и близка к RESULT_MAX_SIDE. Для palette="custom" нужен
+    palette_colors (своя палитра пользователя).
     """
     if pixel_size not in GRID_BY_SIZE:
         raise ValueError(f"неизвестный размер пикселя: {pixel_size}")
-    if palette != "auto" and palette not in FIXED_PALETTES:
+    if palette == "custom" and not palette_colors:
+        raise ValueError("для своей палитры не заданы цвета")
+    if palette != "auto" and palette != "custom" and palette not in FIXED_PALETTES:
         raise ValueError(f"неизвестная палитра: {palette}")
     n_colors = max(2, min(64, int(n_colors)))
 
@@ -115,10 +130,11 @@ def make_pixel_art(
         grid_h = grid_big
         grid_w = max(1, round(width * grid_big / height))
 
-    # 2) лёгкое усиление контраста и насыщенности, затем BOX-усреднение до сетки
-    enhanced = ImageEnhance.Contrast(img).enhance(1.1)
-    enhanced = ImageEnhance.Color(enhanced).enhance(1.15)
-    small = enhanced.resize((grid_w, grid_h), Image.Resampling.BOX)
+    # 2) коррекции контраста/насыщенности/резкости, затем BOX-усреднение до сетки
+    adjusted = ImageEnhance.Contrast(img).enhance(contrast)
+    adjusted = ImageEnhance.Color(adjusted).enhance(saturation)
+    adjusted = ImageEnhance.Sharpness(adjusted).enhance(sharpness)
+    small = adjusted.resize((grid_w, grid_h), Image.Resampling.BOX)
 
     # 3) квантизация цветов
     if palette == "auto":
@@ -126,6 +142,8 @@ def make_pixel_art(
         small = small.quantize(
             colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=dither_mode
         ).convert("RGB")
+    elif palette == "custom":
+        small = _map_to_fixed_palette(small, palette_colors, dither=dither)
     else:
         small = _map_to_fixed_palette(small, FIXED_PALETTES[palette], dither=dither)
 
@@ -181,7 +199,7 @@ def _bayer_offsets(width: int, height: int) -> np.ndarray:
 # ---------------------------------------------------------------- рендер результата
 
 
-def render(source: bytes, settings: Settings) -> bytes:
+def render(source: bytes, settings: Settings, custom_palette: tuple | None = None) -> bytes:
     """Собрать PNG результата из сжатого исходника по настройкам."""
     img = Image.open(io.BytesIO(source)).convert("RGB")
     art = make_pixel_art(
@@ -190,7 +208,88 @@ def render(source: bytes, settings: Settings) -> bytes:
         palette=settings.palette,
         n_colors=settings.n_colors,
         dither=settings.dither,
+        contrast=settings.contrast,
+        saturation=settings.saturation,
+        sharpness=settings.sharpness,
+        palette_colors=custom_palette,
     )
     buffer = io.BytesIO()
     art.save(buffer, "PNG", optimize=True)
     return buffer.getvalue()
+
+
+# ---------------------------------------------------------------- свои палитры и анимации
+
+
+def extract_palette(img: Image.Image, n_colors: int = 16) -> tuple:
+    """Основные цвета изображения (mediancut) — для «своей палитры» из фото."""
+    n_colors = max(2, min(64, int(n_colors)))
+    quantized = img.quantize(
+        colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
+    )
+    palette = quantized.getpalette() or []
+    used_indices = sorted(set(np.asarray(quantized).reshape(-1).tolist()))
+    colors = []
+    for index in used_indices:
+        rgb = tuple(int(c) for c in palette[index * 3 : index * 3 + 3])
+        if len(rgb) == 3:
+            colors.append(rgb)
+    return tuple(dict.fromkeys(colors))
+
+
+def extract_first_frame(data: bytes) -> bytes:
+    """Первый кадр анимации как PNG: GIF/WebP — через Pillow, MP4 — через imageio+ffmpeg."""
+    try:
+        img = Image.open(io.BytesIO(data))
+        img.seek(0)  # первый кадр
+        out = io.BytesIO()
+        img.save(out, "PNG")
+        return out.getvalue()
+    except Exception:
+        pass  # не картинка для Pillow — пробуем как видео
+    try:
+        import imageio.v3 as iio
+
+        frame = np.asarray(iio.imread(io.BytesIO(data), index=0, extension=".mp4"))
+    except ImportError as exc:
+        raise UnsupportedMediaError("модуль imageio не установлен") from exc
+    except Exception as exc:
+        raise UnsupportedMediaError("не удалось извлечь первый кадр") from exc
+    if frame.ndim == 2:  # ч/б кадр
+        frame = np.stack([frame] * 3, axis=-1)
+    if frame.shape[-1] == 4:  # альфа-канал
+        frame = frame[..., :3]
+    out = io.BytesIO()
+    Image.fromarray(frame.astype(np.uint8), "RGB").save(out, "PNG")
+    return out.getvalue()
+
+
+# ---------------------------------------------------------------- демо-картинка
+
+
+def build_demo_image() -> Image.Image:
+    """Тестовая картинка для /demo: небо, солнце, холмы, домик."""
+    width, height = 1024, 768
+    img = Image.new("RGB", (width, height))
+    draw = ImageDraw.Draw(img)
+    # небо: градиент от синего к закатному
+    for y in range(height):
+        t = y / height
+        r = int(110 + (255 - 110) * t)
+        g = int(180 + (180 - 180) * t)
+        b = int(255 + (120 - 255) * t)
+        draw.line([(0, y), (width, y)], fill=(r, g, b))
+    # солнце и облака
+    draw.ellipse((760, 80, 940, 260), fill=(255, 235, 90))
+    for cx, cy, cw in ((160, 140, 220), (430, 90, 160), (620, 210, 180)):
+        draw.ellipse((cx - cw // 2, cy - 40, cx + cw // 2, cy + 40), fill=(250, 250, 250))
+    # земля и холмы
+    draw.ellipse((-200, 640, width + 200, 1100), fill=(74, 120, 60))
+    draw.ellipse((500, 600, 1400, 1050), fill=(96, 150, 70))
+    draw.rectangle((0, 660, width, height), fill=(70, 110, 55))
+    # домик
+    draw.rectangle((180, 430, 470, 640), fill=(214, 122, 84))
+    draw.polygon([(160, 430), (490, 430), (325, 300)], fill=(146, 66, 52))
+    draw.rectangle((240, 480, 330, 560), fill=(255, 222, 120))  # окно
+    draw.rectangle((370, 500, 440, 640), fill=(110, 70, 45))  # дверь
+    return img

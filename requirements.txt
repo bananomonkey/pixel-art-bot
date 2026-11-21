@@ -1,4 +1,6 @@
 aiogram>=3.0
 Pillow
 numpy
+imageio
+imageio-ffmpeg
 # для тестов: pip install pytest

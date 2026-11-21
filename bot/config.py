@@ -48,3 +48,20 @@ BROADCAST_MIN_INTERVAL = 60.0  # секунд (минимум — 1 минута
 BROADCAST_MAX_INTERVAL = 30 * 86400.0  # секунд (максимум — 30 дней)
 BROADCAST_SEND_RATE = 20  # сообщений в секунду (лимит Telegram ~30)
 BROADCAST_TICK = 5.0  # период опроса расписания воркером
+TEMPLATES_MAX = 20  # шаблоны постов
+TARGETED_MAX_DAYS = 30  # «разово активным за N дней»
+DAILY_STATS_DAYS = 30  # глубина дневной статистики
+
+# --- пользовательские функции ---
+USER_STORE_MAX_ENTRIES = 2000  # LRU для любимых стилей и своих палитр
+PALETTE_MAX_COLORS = 64  # максимум цветов в своей палитре
+
+# --- коррекции изображения (кнопки ±) ---
+DEFAULT_CONTRAST = 1.1
+DEFAULT_SATURATION = 1.15
+DEFAULT_SHARPNESS = 1.0
+CONTRAST_RANGE = (0.6, 2.0)
+SATURATION_RANGE = (0.4, 2.2)
+SHARPNESS_RANGE = (0.5, 3.0)
+ADJUSTMENT_STEP = 0.2  # контраст и насыщенность
+SHARPNESS_STEP = 0.25  # резкость

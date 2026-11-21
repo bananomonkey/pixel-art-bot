@@ -2,7 +2,10 @@
 
 Все цвета — кортежи (R, G, B) 0–255. Палитра «Авто» фиксированных цветов
 не имеет: она квантизует mediancut'ом произвольное число цветов.
+Здесь же — разбор hex-списка для «своей палитры» пользователя.
 """
+
+import re
 
 # --- Game Boy: 4 оттенка зелёного ---
 GAME_BOY = tuple(
@@ -101,3 +104,21 @@ def as_numpy(colors: tuple[tuple[int, int, int], ...]):
     import numpy as np
 
     return np.asarray(colors, dtype=np.uint8)
+
+
+_HEX_COLOR = re.compile(r"#?\b([0-9a-fA-F]{3}|[0-9a-fA-F]{6})\b")
+
+
+def parse_hex_colors(text: str) -> tuple[tuple[int, int, int], ...]:
+    """«#FF004D 0f380f, #abc» -> кортеж RGB; дубли убираются, порядок сохранён.
+
+    Поддерживает 6- и 3-значные hex, любые разделители. Мусор игнорируется.
+    """
+    found: dict[tuple[int, int, int], None] = {}
+    for match in _HEX_COLOR.finditer(text or ""):
+        hex_part = match.group(1)
+        if len(hex_part) == 3:
+            hex_part = "".join(ch * 2 for ch in hex_part)
+        rgb = tuple(int(hex_part[i : i + 2], 16) for i in (0, 2, 4))
+        found.setdefault(rgb, None)
+    return tuple(found)

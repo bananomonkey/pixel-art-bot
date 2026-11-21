@@ -1,4 +1,4 @@
-"""Хэндлеры aiogram 3.x: приём фото, кнопки стиля, редактирование результата.
+"""Хэндлеры aiogram 3.x: фото/стикеры/GIF, кнопки стиля, инлайн, свои палитры, любимый стиль.
 
 Никаких команд вводить не нужно: пришло фото -> сразу результат с кнопками.
 Фото и результаты только в памяти (io.BytesIO), на диск не пишутся и не логируются.
@@ -13,7 +13,7 @@ from collections import OrderedDict
 from dataclasses import replace
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramBadRequest
+from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -21,40 +21,68 @@ from aiogram.types import (
     ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQuery,
+    InlineQueryResultCachedPhoto,
+    InlineQueryResultsButton,
     InputMediaPhoto,
     Message,
 )
 
-from .admin import chats, register_admin_handlers, stats
+from .admin import (
+    cancel_admin_flow,
+    chats,
+    is_banned,
+    record_photo,
+    register_admin_handlers,
+)
 from .config import (
+    ADJUSTMENT_STEP,
+    DEFAULT_CONTRAST,
+    DEFAULT_SATURATION,
+    DEFAULT_SHARPNESS,
     MAX_CONCURRENT_JOBS,
     MAX_FILE_SIZE,
+    PALETTE_MAX_COLORS,
     RATE_LIMIT_SECONDS,
+    SATURATION_RANGE,
+    SHARPNESS_RANGE,
+    SHARPNESS_STEP,
+    CONTRAST_RANGE,
     STATE_MAX_ENTRIES,
     STATE_TTL_SECONDS,
+    USER_STORE_MAX_ENTRIES,
 )
-from .palettes import PALETTE_LABELS, PALETTE_ORDER
+from .palettes import PALETTE_LABELS, PALETTE_ORDER, parse_hex_colors
 from .pixelart import (
     GRID_BY_SIZE,
     ImageTooLargeError,
     UnsupportedMediaError,
+    build_demo_image,
     decode_source,
     encode_source,
+    extract_first_frame,
+    extract_palette,
     render,
 )
-from .state import COLOR_STEPS, SIZE_LABELS, SIZE_ORDER, Settings, StateStore
+from .state import COLOR_STEPS, PerUserStore, SIZE_LABELS, SIZE_ORDER, Settings, StateStore
 
 logger = logging.getLogger(__name__)
 router = Router()
-# админ-хэндлеры (/admin, /cancel, перехват поста) — в начале цепочки,
+# админ-хэндлеры (/admin, /ban, перехват поста) — в начале цепочки,
 # чтобы фото админа во время создания рассылки не уходило в пикселизацию
 register_admin_handlers(router)
 
 # --- общие singleton'ы в памяти процесса ---
 store = StateStore(max_entries=STATE_MAX_ENTRIES, ttl_seconds=STATE_TTL_SECONDS)
+favorites = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> Settings
+custom_palettes = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> палитра
+_palette_flow: set[int] = set()  # пользователи, ожидающие ввода своей палитры
 _jobs = asyncio.Semaphore(MAX_CONCURRENT_JOBS)  # не более 2 одновременных обработок
 _last_photo_at: dict[int, float] = {}
 _albums_seen: "OrderedDict[str, None]" = OrderedDict()
+
+_demo_source: bytes | None = None
+_style_previews: dict[str, str] = {}  # палитра -> file_id превью (для инлайна)
 
 # --- реплики ---
 TEXT_NOT_A_PHOTO = "Пришли фото, сделаю пиксель-арт"
@@ -68,18 +96,38 @@ TEXT_COLORS_ONLY_AUTO = "Число цветов меняется только �
 TEXT_COLORS_MAX = "Максимум — 64 цвета"
 TEXT_COLORS_MIN = "Минимум — 8 цветов"
 
+# кнопка -> (поле Settings, диапазон, шаг, значение по умолчанию)
+_ADJUSTMENTS = {
+    "con": ("contrast", CONTRAST_RANGE, ADJUSTMENT_STEP, DEFAULT_CONTRAST),
+    "sat": ("saturation", SATURATION_RANGE, ADJUSTMENT_STEP, DEFAULT_SATURATION),
+    "shp": ("sharpness", SHARPNESS_RANGE, SHARPNESS_STEP, DEFAULT_SHARPNESS),
+}
+
 
 # ---------------------------------------------------------------- команды
+
+
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message) -> None:
+    """Отмена активного флоу (и админского, и создания своей палитры)."""
+    if message.from_user is None:
+        return
+    uid = message.from_user.id
+    cancelled = cancel_admin_flow(uid)
+    if uid in _palette_flow:
+        _palette_flow.discard(uid)
+        cancelled = True
+    await message.answer("Действие отменено." if cancelled else "Нет активного действия.")
 
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
     chats.touch(message.chat.id)
     await message.answer(
-        "Пришли фото — сразу верну пиксель-арт 🎨\n\n"
-        "Под результатом кнопки: размер пикселя, палитра, дизеринг, "
-        "больше/меньше цветов (для «Авто»), скачивание PNG без сжатия "
-        "и «Другой стиль»."
+        "Пришли фото, стикер или GIF — сразу верну пиксель-арт 🎨\n\n"
+        "Под результатом кнопки: размер пикселя, палитра, дизеринг, коррекции, "
+        "«🔖 Запомнить» (стиль для новых фото) и «📎 Скачать PNG» без сжатия.\n"
+        "Напиши /demo, чтобы попробовать на примере."
     )
 
 
@@ -87,20 +135,151 @@ async def cmd_start(message: Message) -> None:
 async def cmd_help(message: Message) -> None:
     await message.answer(
         "Как пользоваться:\n"
-        "1. Пришли фото (или файл jpg/png/webp).\n"
+        "1. Пришли фото, стикер или GIF (выйдет первый кадр).\n"
         "2. Получишь пиксель-арт с настройками по умолчанию.\n"
         "3. Меняй стиль кнопками под фото — картинка перерисуется на месте.\n\n"
-        "Палитры: Авто (8–64 цвета), Game Boy, NES, PICO-8, C64, Ч/Б, CGA.\n"
+        "Команды:\n"
+        "/palette — своя палитра: hex-цвета или фото (16 основных цветов)\n"
+        "/mystyle — показать/сбросить сохранённый стиль\n"
+        "/demo — попробовать на тестовой картинке\n\n"
+        "Палитры: Авто (8–64 цвета), Game Boy, NES, PICO-8, C64, Ч/Б, CGA, Свои.\n"
         "«📎 Скачать PNG» отправляет файл без пережатия Telegram."
     )
 
 
-# ---------------------------------------------------------------- приём фото
+@router.message(Command("palette"))
+async def cmd_palette(message: Message) -> None:
+    if message.from_user is None:
+        return
+    chats.touch(message.chat.id)
+    _palette_flow.add(message.from_user.id)
+    await message.answer(
+        "🎨 Пришли следующим сообщением:\n"
+        "• hex-цвета через пробел/запятую: #FF004D 00E436 7E2553\n"
+        "• или фото — возьму основные цвета (до 64).\n"
+        "/cancel — отмена."
+    )
+
+
+@router.message(Command("mystyle"))
+async def cmd_mystyle(message: Message) -> None:
+    if message.from_user is None:
+        return
+    chats.touch(message.chat.id)
+    settings = favorites.get(message.from_user.id)
+    if settings is None:
+        await message.answer("Сохранённого стиля нет. Настрой стиль и нажми «🔖 Запомнить».")
+        return
+    await message.answer(
+        f"🔖 Сохранённый стиль: {_describe_settings(settings)}\n"
+        "Он применяется ко всем новым фото.",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🗑 Сбросить", callback_data="fav_clear")]]
+        ),
+    )
+
+
+@router.message(Command("demo"))
+async def cmd_demo(message: Message, bot: Bot) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    chats.touch(message.chat.id)
+    if not _allow_rate(uid):
+        await message.answer(TEXT_RATE_LIMIT)
+        return
+    source = await _get_demo_source()
+    settings = Settings(
+        pixel_size=random.choice(SIZE_ORDER),
+        palette=random.choice(PALETTE_ORDER),
+        dither=random.random() < 0.3,
+    )
+    async with _jobs:
+        png = await asyncio.to_thread(render, source, settings, None)
+    sent = await message.answer_photo(
+        BufferedInputFile(png, filename="pixel_demo.png"),
+        caption="🎲 Демо: " + _caption(settings),
+        reply_markup=_keyboard(settings),
+    )
+    store.put(message.chat.id, sent.message_id, source, settings)
+
+
+# ---------------------------------------------------------------- свои палитры (флоу)
+
+
+async def palette_capture(message: Message, bot: Bot) -> None:
+    """Перехватывает ввод пользователя, создающего свою палитру."""
+    uid = message.from_user.id if message.from_user else None
+    if uid is None or uid not in _palette_flow:
+        raise SkipHandler  # вне флоу — обычная обработка
+
+    if message.media_group_id is not None:
+        await message.answer("Пришли одним сообщением (без альбома).")
+        return
+
+    colors = None
+    if message.text:
+        colors = parse_hex_colors(message.text)
+        if len(colors) < 2:
+            await message.answer(
+                "Не нашёл цветов (нужно хотя бы два). Пример: #FF004D 00E436 7E2553 — или /cancel."
+            )
+            return
+    elif message.photo or (message.document and _is_image_doc(message.document)):
+        try:
+            if message.photo:
+                data = await _download(bot, message.photo[-1].file_id)
+            else:
+                data = await _download(bot, message.document.file_id)
+            async with _jobs:
+                img = await asyncio.to_thread(decode_source, data)
+                colors = await asyncio.to_thread(extract_palette, img, PALETTE_MAX_COLORS)
+        except (UnsupportedMediaError, ImageTooLargeError):
+            await message.answer(TEXT_NOT_A_PHOTO)
+            return
+        except TelegramBadRequest as exc:
+            logger.warning("скачивание для палитры не удалось: %s", exc)
+            await message.answer(TEXT_ERROR)
+            return
+    else:
+        await message.answer("Пришли текст с hex-цветами или фото — или /cancel.")
+        return
+
+    custom_palettes.put(uid, colors[:PALETTE_MAX_COLORS])
+    _palette_flow.discard(uid)
+    await message.answer(
+        f"✅ Своя палитра: {len(colors[:PALETTE_MAX_COLORS])} цветов. "
+        "Нажми «Свои» под любым результатом."
+    )
+
+
+def _is_image_doc(document) -> bool:
+    mime = document.mime_type or ""
+    name = (document.file_name or "").lower()
+    return mime.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".webp"))
+
+
+# перехват до on_photo/on_document: сообщения пользователей в флоу своей палитры
+router.message.register(
+    palette_capture,
+    F.photo | F.document | (F.text & ~F.text.startswith("/")),
+)
+
+
+# ---------------------------------------------------------------- приём фото/стикеров/GIF
+
+
+def _user_ok(message: Message) -> int | None:
+    """ID пользователя, если можно обрабатывать (не бан, не канал)."""
+    if message.from_user is None or is_banned(message.from_user.id):
+        return None
+    return message.from_user.id
 
 
 @router.message(F.photo)
 async def on_photo(message: Message, bot: Bot) -> None:
-    if message.from_user is None:
+    uid = _user_ok(message)
+    if uid is None:
         return
     chats.touch(message.chat.id)
     album = False
@@ -108,7 +287,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
         album = _claim_album(message.media_group_id)
         if not album:
             return  # остальные фото альбома молча пропускаем
-    if not _allow_rate(message.from_user.id):
+    if not _allow_rate(uid):
         await message.answer(TEXT_RATE_LIMIT)
         return
     photo = message.photo[-1]  # наибольший размер
@@ -118,34 +297,58 @@ async def on_photo(message: Message, bot: Bot) -> None:
 
 @router.message(F.document)
 async def on_document(message: Message, bot: Bot) -> None:
-    if message.from_user is None:
+    uid = _user_ok(message)
+    if uid is None:
         return
     chats.touch(message.chat.id)
     document = message.document
     name = (document.file_name or "").lower()
     mime = document.mime_type or ""
-    if mime == "image/gif" or name.endswith(".gif"):
-        await message.answer(TEXT_ANIMATED)
-        return
-    if not (mime.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".webp"))):
+    is_gif = mime == "image/gif" or name.endswith(".gif")
+    if not is_gif and not _is_image_doc(document):
         await message.answer(TEXT_NOT_A_PHOTO)
         return
     if document.file_size is not None and document.file_size > MAX_FILE_SIZE:
         await message.answer(TEXT_TOO_BIG_FILE)
         return
-    if not _allow_rate(message.from_user.id):
+    if not _allow_rate(uid):
         await message.answer(TEXT_RATE_LIMIT)
         return
     data = await _download(bot, document.file_id)
     if len(data) > MAX_FILE_SIZE:
         await message.answer(TEXT_TOO_BIG_FILE)
         return
-    await _process_new(message, bot, data, album=False)
+    await _process_new(message, bot, data, first_frame=is_gif)
 
 
-@router.message(F.animation | F.video | F.video_note)
-async def on_animation(message: Message) -> None:
-    await message.answer(TEXT_ANIMATED)
+@router.message(F.sticker)
+async def on_sticker(message: Message, bot: Bot) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    chats.touch(message.chat.id)
+    sticker = message.sticker
+    if sticker.is_animated or sticker.is_video:
+        await message.answer(TEXT_ANIMATED)
+        return
+    if not _allow_rate(uid):
+        await message.answer(TEXT_RATE_LIMIT)
+        return
+    data = await _download(bot, sticker.file_id)
+    await _process_new(message, bot, data)
+
+
+@router.message(F.animation)
+async def on_animation(message: Message, bot: Bot) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    chats.touch(message.chat.id)
+    if not _allow_rate(uid):
+        await message.answer(TEXT_RATE_LIMIT)
+        return
+    data = await _download(bot, message.animation.file_id)
+    await _process_new(message, bot, data, first_frame=True)
 
 
 async def _download(bot: Bot, file_id: str) -> bytes:
@@ -156,20 +359,32 @@ async def _download(bot: Bot, file_id: str) -> bytes:
     return buffer.getvalue()
 
 
-async def _process_new(message: Message, bot: Bot, data: bytes, *, album: bool) -> None:
+async def _process_new(
+    message: Message, bot: Bot, data: bytes, *, album: bool = False, first_frame: bool = False
+) -> None:
     """Обработать новое фото и отправить результат с кнопками."""
-    settings = Settings()
+    uid = message.from_user.id if message.from_user else None
+    settings = favorites.get(uid) if uid is not None else None
+    custom = None
+    if settings is not None and settings.palette == "custom":
+        custom = custom_palettes.get(uid) if uid is not None else None
+        if custom is None:  # любимый стиль ссылается на удалённую палитру
+            settings = Settings()
+    elif settings is None:
+        settings = Settings()
     try:
         async with _jobs:
+            if first_frame:
+                data = await asyncio.to_thread(extract_first_frame, data)
             source_img = await asyncio.to_thread(decode_source, data)
             source = await asyncio.to_thread(encode_source, source_img)
             del data, source_img  # память: держим только сжатый исходник
-            png = await asyncio.to_thread(render, source, settings)
+            png = await asyncio.to_thread(render, source, settings, custom)
     except ImageTooLargeError:
         await message.answer(TEXT_TOO_BIG_DIMS)
         return
     except UnsupportedMediaError:
-        await message.answer(TEXT_NOT_A_PHOTO)
+        await message.answer(TEXT_ANIMATED if first_frame else TEXT_NOT_A_PHOTO)
         return
 
     caption = _caption(settings)
@@ -181,12 +396,12 @@ async def _process_new(message: Message, bot: Bot, data: bytes, *, album: bool) 
         caption=caption,
         reply_markup=_keyboard(settings),
     )
-    store.put(message.chat.id, sent.message_id, source, settings)
-    stats["photos"] += 1
+    store.put(message.chat.id, sent.message_id, source, settings, custom_palette=custom)
+    record_photo(uid)
     logger.info("новое фото обработано, сетка=%s", GRID_BY_SIZE[settings.pixel_size])
 
 
-# ---------------------------------------------------------------- кнопки
+# ---------------------------------------------------------------- кнопки стиля
 
 
 @router.callback_query(F.data.startswith("size:"))
@@ -206,7 +421,7 @@ async def cb_size(callback: CallbackQuery, bot: Bot) -> None:
 @router.callback_query(F.data.startswith("pal:"))
 async def cb_palette(callback: CallbackQuery, bot: Bot) -> None:
     value = (callback.data or "").split(":", 1)[-1]
-    if value not in PALETTE_ORDER:
+    if value not in PALETTE_ORDER and value != "custom":
         await callback.answer()
         return
     loaded = _load(callback)
@@ -214,6 +429,22 @@ async def cb_palette(callback: CallbackQuery, bot: Bot) -> None:
         await _stale(callback)
         return
     chat_id, message_id, entry = loaded
+    if value == "custom":
+        palette = custom_palettes.get(callback.from_user.id)
+        if palette is None:
+            # палитры нет — запускаем создание, картинку не трогаем
+            _palette_flow.add(callback.from_user.id)
+            await callback.answer(
+                "Своей палитры нет. Пришли следующим сообщением hex-цвета или фото — создам.",
+                show_alert=True,
+            )
+            return
+        await _apply(
+            callback, bot, chat_id, message_id, entry,
+            replace(entry.settings, palette="custom"),
+            custom_palette=palette,
+        )
+        return
     await _apply(callback, bot, chat_id, message_id, entry, replace(entry.settings, palette=value))
 
 
@@ -226,6 +457,43 @@ async def cb_dither(callback: CallbackQuery, bot: Bot) -> None:
     chat_id, message_id, entry = loaded
     flipped = replace(entry.settings, dither=not entry.settings.dither)
     await _apply(callback, bot, chat_id, message_id, entry, flipped)
+
+
+@router.callback_query(F.data.startswith("adj:"))
+async def cb_adjust(callback: CallbackQuery, bot: Bot) -> None:
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    try:
+        _, kind, sign = (callback.data or "").split(":")
+        field, (lo, hi), step, _default = _ADJUSTMENTS[kind]
+    except (KeyError, ValueError):
+        await callback.answer()
+        return
+    current = getattr(entry.settings, field)
+    new_value = round(max(lo, min(hi, current + (step if sign == "p" else -step))), 2)
+    if new_value == current:
+        await callback.answer("Предел достигнут", show_alert=True)
+        return
+    await _apply(callback, bot, chat_id, message_id, entry, replace(entry.settings, **{field: new_value}))
+
+
+@router.callback_query(F.data == "adj_reset")
+async def cb_adjust_reset(callback: CallbackQuery, bot: Bot) -> None:
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    settings = replace(
+        entry.settings,
+        contrast=DEFAULT_CONTRAST,
+        saturation=DEFAULT_SATURATION,
+        sharpness=DEFAULT_SHARPNESS,
+    )
+    await _apply(callback, bot, chat_id, message_id, entry, settings, toast="Коррекции сброшены")
 
 
 @router.callback_query(F.data == "more")
@@ -268,6 +536,50 @@ async def cb_less_colors(callback: CallbackQuery, bot: Bot) -> None:
     )
 
 
+@router.callback_query(F.data == "fav_save")
+async def cb_fav_save(callback: CallbackQuery) -> None:
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    _chat_id, _message_id, entry = loaded
+    favorites.put(callback.from_user.id, replace(entry.settings))
+    await callback.answer("🔖 Стиль запомнен — будет применяться к новым фото (/mystyle — сброс)")
+
+
+@router.callback_query(F.data == "fav_clear")
+async def cb_fav_clear(callback: CallbackQuery) -> None:
+    favorites.drop(callback.from_user.id)
+    await callback.answer("Стиль сброшен — новые фото снова в настройках по умолчанию.")
+
+
+@router.callback_query(F.data == "demo")
+async def cb_demo(callback: CallbackQuery, bot: Bot) -> None:
+    uid = callback.from_user.id if callback.from_user else None
+    if uid is None or is_banned(uid):
+        await callback.answer()
+        return
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    _chat_id, _message_id, entry = loaded
+    if not _allow_rate(uid):
+        await callback.answer(TEXT_RATE_LIMIT)
+        return
+    source = await _get_demo_source()
+    async with _jobs:
+        png = await asyncio.to_thread(render, source, entry.settings, entry.custom_palette)
+    sent = await bot.send_photo(
+        loaded[0],
+        BufferedInputFile(png, filename="pixel_demo.png"),
+        caption="🎲 Демо: " + _caption(entry.settings),
+        reply_markup=_keyboard(entry.settings),
+    )
+    store.put(loaded[0], sent.message_id, source, entry.settings, custom_palette=entry.custom_palette)
+    await callback.answer()
+
+
 @router.callback_query(F.data == "download")
 async def cb_download(callback: CallbackQuery, bot: Bot) -> None:
     loaded = _load(callback)
@@ -276,7 +588,7 @@ async def cb_download(callback: CallbackQuery, bot: Bot) -> None:
         return
     chat_id, _message_id, entry = loaded
     async with _jobs:
-        png = await asyncio.to_thread(render, entry.source, entry.settings)
+        png = await asyncio.to_thread(render, entry.source, entry.settings, entry.custom_palette)
     await bot.send_document(
         chat_id,
         BufferedInputFile(png, filename=_filename(entry.settings)),
@@ -299,6 +611,64 @@ async def cb_random(callback: CallbackQuery, bot: Bot) -> None:
         pixel_size=random.choice([key for key in SIZE_ORDER if key != current.pixel_size]),
     )
     await _apply(callback, bot, chat_id, message_id, entry, settings)
+
+
+# ---------------------------------------------------------------- инлайн-режим
+
+
+@router.inline_query()
+async def on_inline_query(query: InlineQuery, bot: Bot) -> None:
+    """Превью стилей: первый запуск тихо отправляет примеры в личку с ботом."""
+    results = []
+    try:
+        for key in PALETTE_ORDER:
+            file_id = _style_previews.get(key)
+            if file_id is None:
+                file_id = await _upload_preview(bot, query.from_user.id, key)
+                _style_previews[key] = file_id
+            results.append(
+                InlineQueryResultCachedPhoto(
+                    id=f"style_{key}",
+                    photo_file_id=file_id,
+                    title=f"Пиксель-арт · {PALETTE_LABELS[key]}",
+                    description="Нажми, чтобы отправить пример стиля в чат",
+                )
+            )
+    except (TelegramForbiddenError, TelegramBadRequest):
+        results = []  # бот не запущен пользователем — покажем кнопку запуска
+    await query.answer(
+        results,
+        cache_time=300,
+        button=InlineQueryResultsButton(
+            switch_pm_text="▶️ Запусти бота", switch_pm_parameter="start"
+        ),
+    )
+
+
+async def _upload_preview(bot: Bot, chat_id: int, palette_key: str) -> str:
+    source = await _get_demo_source()
+    async with _jobs:
+        png = await asyncio.to_thread(render, source, Settings(palette=palette_key), None)
+    message = await bot.send_photo(
+        chat_id,
+        BufferedInputFile(png, filename=f"preview_{palette_key}.png"),
+        disable_notification=True,
+    )
+    return message.photo[-1].file_id
+
+
+# ---------------------------------------------------------------- демо-исходник
+
+
+async def _get_demo_source() -> bytes:
+    global _demo_source
+    if _demo_source is None:
+        async with _jobs:
+            if _demo_source is None:
+                _demo_source = await asyncio.to_thread(
+                    lambda: encode_source(build_demo_image())
+                )
+    return _demo_source
 
 
 # ---------------------------------------------------------------- общие помощники
@@ -327,10 +697,14 @@ async def _apply(
     message_id: int,
     entry,
     settings: Settings,
+    custom_palette: tuple | None = None,
+    toast: str | None = None,
 ) -> None:
     """Перерисовать результат на месте (edit_message_media) и сохранить настройки."""
+    if custom_palette is None:
+        custom_palette = entry.custom_palette
     async with _jobs:
-        png = await asyncio.to_thread(render, entry.source, settings)
+        png = await asyncio.to_thread(render, entry.source, settings, custom_palette)
     try:
         await bot.edit_message_media(
             chat_id=chat_id,
@@ -348,12 +722,12 @@ async def _apply(
             logger.warning("edit_message_media не удался: %s", exc)
             await callback.answer(TEXT_ERROR, show_alert=True)
             return
-    store.put(chat_id, message_id, entry.source, settings)  # обновит настройки и LRU/TTL
-    await callback.answer()
+    store.put(chat_id, message_id, entry.source, settings, custom_palette=custom_palette)
+    await callback.answer(toast)
 
 
 def _keyboard(settings: Settings) -> InlineKeyboardMarkup:
-    """Компактная inline-клавиатура с пометками ✓ у выбранных значений."""
+    """Inline-клавиатура стиля с пометками ✓ у выбранных значений."""
     def mark(text: str, active: bool) -> str:
         return f"{text} ✓" if active else text
 
@@ -373,6 +747,9 @@ def _keyboard(settings: Settings) -> InlineKeyboardMarkup:
                 callback_data=f"pal:{key}",
             )
         )
+    palette_row.append(
+        InlineKeyboardButton(text=mark("Свои", settings.palette == "custom"), callback_data="pal:custom")
+    )
     options_row = [
         InlineKeyboardButton(
             text=f"Дизеринг: {'вкл' if settings.dither else 'выкл'}",
@@ -381,21 +758,56 @@ def _keyboard(settings: Settings) -> InlineKeyboardMarkup:
         InlineKeyboardButton(text="Больше цветов", callback_data="more"),
         InlineKeyboardButton(text="Меньше цветов", callback_data="less"),
     ]
+    contrast_row = [
+        InlineKeyboardButton(text="Контраст −", callback_data="adj:con:m"),
+        InlineKeyboardButton(text="Контраст +", callback_data="adj:con:p"),
+        InlineKeyboardButton(text="Насыщ −", callback_data="adj:sat:m"),
+        InlineKeyboardButton(text="Насыщ +", callback_data="adj:sat:p"),
+    ]
+    sharp_row = [
+        InlineKeyboardButton(text="Резк −", callback_data="adj:shp:m"),
+        InlineKeyboardButton(text="Резк +", callback_data="adj:shp:p"),
+        InlineKeyboardButton(text="🔖 Запомнить", callback_data="fav_save"),
+        InlineKeyboardButton(text="🎲 Демо", callback_data="demo"),
+    ]
     actions_row = [
         InlineKeyboardButton(text="📎 Скачать PNG", callback_data="download"),
         InlineKeyboardButton(text="🎲 Другой стиль", callback_data="random"),
+        InlineKeyboardButton(text="↺ Сброс корр.", callback_data="adj_reset"),
     ]
     return InlineKeyboardMarkup(
-        inline_keyboard=[size_row, palette_row, options_row, actions_row]
+        inline_keyboard=[
+            size_row,
+            palette_row,
+            options_row,
+            contrast_row,
+            sharp_row,
+            actions_row,
+        ]
     )
 
 
 def _caption(settings: Settings) -> str:
     palette_label = (
-        f"Авто ({settings.n_colors})" if settings.palette == "auto" else PALETTE_LABELS[settings.palette]
+        f"Авто ({settings.n_colors})" if settings.palette == "auto" else (
+            "Свои" if settings.palette == "custom" else PALETTE_LABELS[settings.palette]
+        )
     )
-    dither_label = "вкл" if settings.dither else "выкл"
-    return f"🎨 {GRID_BY_SIZE[settings.pixel_size]} px · {palette_label} · дизеринг {dither_label}"
+    text = f"🎨 {GRID_BY_SIZE[settings.pixel_size]} px · {palette_label} · дизеринг {'вкл' if settings.dither else 'выкл'}"
+    adjustments = []
+    if settings.contrast != DEFAULT_CONTRAST:
+        adjustments.append(f"контраст {settings.contrast:g}")
+    if settings.saturation != DEFAULT_SATURATION:
+        adjustments.append(f"насыщ {settings.saturation:g}")
+    if settings.sharpness != DEFAULT_SHARPNESS:
+        adjustments.append(f"резкость {settings.sharpness:g}")
+    if adjustments:
+        text += " · " + ", ".join(adjustments)
+    return text
+
+
+def _describe_settings(settings: Settings) -> str:
+    return _caption(settings)
 
 
 def _filename(settings: Settings) -> str:
@@ -429,12 +841,15 @@ def _claim_album(group_id: str) -> bool:
 
 async def periodic_purge() -> None:
     """Фоновая чистка истёкших записей состояния (раз в 5 минут, экономия RAM)."""
+    from .admin import prune_daily
+
     while True:
         await asyncio.sleep(300)
         try:
             removed = store.purge_expired()
             if removed:
                 logger.info("очищено истёкших записей: %d", removed)
+            prune_daily()
         except Exception:  # noqa: BLE001 — фон не должен падать
             logger.exception("ошибка очистки состояния")
 
