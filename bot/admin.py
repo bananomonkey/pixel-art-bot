@@ -11,7 +11,7 @@
 import asyncio
 import logging
 import time
-from datetime import date, timedelta
+from datetime import date
 
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler

@@ -4,7 +4,7 @@ import io
 
 import numpy as np
 import pytest
-from PIL import Image, ImageDraw
+from PIL import Image
 
 from bot.palettes import parse_hex_colors
 from bot.pixelart import (
@@ -217,6 +217,58 @@ def test_broadcast_target_days_stored():
     assert item.target_days == 7.0
     plain = store.add(1, 3, "cycle", 60.0, now=0.0)
     assert plain.target_days is None
+
+
+# ------------------------------------------------------------------ регрессия: перехват вне флоу
+
+
+def test_palette_capture_skips_outside_flow():
+    """Фото пользователя вне флоу палитры должно пропускаться дальше (SkipHandler),
+    а не падать с NameError — регрессия на потерянный импорт."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    from bot import handlers
+
+    fake = SimpleNamespace(
+        from_user=SimpleNamespace(id=424242),
+        media_group_id=None,
+        text=None,
+        photo=None,
+        document=None,
+    )
+    with pytest.raises(SkipHandler):
+        asyncio.run(handlers.palette_capture(fake, bot=None))
+
+
+def test_palette_capture_consumes_text_in_flow():
+    """Внутри флоу текст пользователя перехватывается: мусорный hex — подсказка."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from bot import handlers
+
+    handlers._palette_flow.add(777)
+    answered = []
+
+    class FakeMessage(SimpleNamespace):
+        async def answer(self, text):
+            answered.append(text)
+
+    fake = FakeMessage(
+        from_user=SimpleNamespace(id=777),
+        media_group_id=None,
+        text="привет как дела",
+        photo=None,
+        document=None,
+    )
+    try:
+        asyncio.run(handlers.palette_capture(fake, bot=None))
+    finally:
+        handlers._palette_flow.discard(777)
+    assert answered and "Не нашёл цветов" in answered[0]
 
 
 def test_parse_target_days():
