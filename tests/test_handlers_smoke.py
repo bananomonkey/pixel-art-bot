@@ -65,6 +65,14 @@ class FakeBot:
             date=datetime.now(timezone.utc),
         )
 
+    async def send_message(self, chat_id, text, **kwargs):
+        self.calls.append(("send_message", text))
+        return Message(
+            message_id=102,
+            chat=Chat(id=chat_id, type="private"),
+            date=datetime.now(timezone.utc),
+        )
+
     async def get_file(self, file_id):
         self.calls.append(("get_file", file_id))
         return SimpleNamespace(file_path="photos/file.jpg")
@@ -246,6 +254,78 @@ def test_reset_all(env):
     entry = handlers.store.get(env.chat_id, env.message_id)
     assert entry.settings == Settings()
     assert entry.view == "main"
+
+
+def test_size_custom_flow(env):
+    """📏 Свой: кнопка ставит флоу, число применяет свой уровень к той же картинке."""
+    cq = _callback(env, "size:custom")
+    _run(handlers.cb_size_custom(cq))
+    assert 1 in handlers._grid_flow
+
+    answered = []
+
+    class FakeMessage(SimpleNamespace):
+        async def answer(self, text):
+            answered.append(text)
+
+    env.bot.calls.clear()
+    msg = FakeMessage(from_user=SimpleNamespace(id=1), text="48")
+    _run(handlers.grid_capture(msg, env.bot))
+    entry = handlers.store.get(env.chat_id, env.message_id)
+    assert entry.settings.pixel_size == "custom" and entry.settings.custom_grid == 48
+    assert any(name == "edit_message_media" for name, _ in env.bot.calls), answered
+    assert 1 not in handlers._grid_flow
+    assert answered and "Свой уровень" in answered[-1]
+
+
+def test_size_custom_flow_invalid_keeps_asking(env):
+    _run(handlers.cb_size_custom(_callback(env, "size:custom")))
+    answered = []
+
+    class FakeMessage(SimpleNamespace):
+        async def answer(self, text):
+            answered.append(text)
+
+    msg = FakeMessage(from_user=SimpleNamespace(id=1), text="abc")
+    _run(handlers.grid_capture(msg, env.bot))
+    assert answered and "Нужно целое число" in answered[0]
+    assert 1 in handlers._grid_flow  # флоу не сброшен — ждём корректное число
+
+
+def test_grid_command_applies_to_recent(env):
+    handlers._recent_entry[env.chat_id] = (env.chat_id, env.message_id)
+    from aiogram.types import Chat, Message, User
+
+    message = Message(
+        message_id=8,
+        chat=Chat(id=env.chat_id, type="private"),
+        date=datetime.now(timezone.utc),
+        from_user=User(id=1, is_bot=False, first_name="t"),
+    )
+    command = SimpleNamespace(args="64")
+    _run(handlers.cmd_grid(message, env.bot, command))
+    entry = handlers.store.get(env.chat_id, env.message_id)
+    assert entry.settings.pixel_size == "custom" and entry.settings.custom_grid == 64
+    assert any(
+        name == "send_message" and "Свой уровень" in text
+        for name, text in env.bot.calls
+    )
+
+
+def test_all_bot_methods_exist():
+    """Регрессия: каждый bot.<метод> из кода хэндлеров существует у aiogram."""
+    import inspect
+    import re
+
+    from aiogram import Bot
+
+    from bot import admin as admin_module
+
+    source = inspect.getsource(handlers) + inspect.getsource(admin_module)
+    used = set(re.findall(r"\bbot\.([a-z_]+)\(", source))
+    assert used, "регулярка перестала находить вызовы"
+    missing = [m for m in sorted(used) if not hasattr(Bot, m)]
+    assert not missing, f"несуществующие методы Bot: {missing}"
 
 
 def test_photo_flow_end_to_end(env):

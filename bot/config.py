@@ -79,3 +79,8 @@ UNIFORM_TRIM_TOLERANCE = 16  # для авто-кадра без вырезки 
 CRT_STEP = 4  # сканлайн каждые N строк результата
 STICKER_MAX_SIDE = 512
 WATERMARK_TEXT = os.getenv("WATERMARK_TEXT", "@pixelartphoto_bot")
+
+# --- свой уровень пикселизации ---
+GRID_MIN = 8  # минимальный размер сетки по большой стороне
+GRID_MAX = 256  # максимальный
+DEFAULT_CUSTOM_GRID = 96  # значение до ввода своего числа

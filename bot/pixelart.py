@@ -17,6 +17,8 @@ from .config import (
     DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
+    GRID_MAX,
+    GRID_MIN,
     MAX_IMAGE_SIDE,
     RESULT_MAX_SIDE,
     SOURCE_MAX_SIDE,
@@ -30,6 +32,17 @@ from .state import Settings
 
 # размер сетки (px по большей стороне) для каждого уровня кнопки «размер пикселя»
 GRID_BY_SIZE: dict[str, int] = {"small": 128, "medium": 96, "large": 64, "huge": 32}
+
+
+def parse_grid(text: str) -> int | None:
+    """«48» -> 48; целое в диапазоне GRID_MIN..GRID_MAX, иначе None."""
+    cleaned = (text or "").strip()
+    if not cleaned.isdigit():
+        return None
+    value = int(cleaned)
+    if value < GRID_MIN or value > GRID_MAX:
+        return None
+    return value
 
 # амплитуда упорядоченного дизеринга Bayer (сдвиг яркости, -32..+31)
 DITHER_STRENGTH = 64.0
@@ -104,6 +117,7 @@ def make_pixel_art(
     img: Image.Image,
     *,
     pixel_size: str = "medium",
+    custom_grid: int | None = None,
     palette: str = "auto",
     n_colors: int = 16,
     dither: bool = False,
@@ -120,10 +134,14 @@ def make_pixel_art(
     """Пикселизация RGB-изображения: фон/кадр -> сетка -> квантизация -> квадраты.
 
     Возвращает RGBA (при вырезке фона) или RGB, большая сторона — целое кратное
-    размера сетки и близка к RESULT_MAX_SIDE. Для palette="custom" нужен
-    palette_colors (своя палитра пользователя).
+    размера сетки и близка к RESULT_MAX_SIDE. pixel_size="custom" использует
+    custom_grid (свой уровень пикселизации, GRID_MIN..GRID_MAX).
     """
-    if pixel_size not in GRID_BY_SIZE:
+    if pixel_size in GRID_BY_SIZE:
+        grid_level = GRID_BY_SIZE[pixel_size]
+    elif pixel_size == "custom" and custom_grid:
+        grid_level = max(GRID_MIN, min(GRID_MAX, int(custom_grid)))
+    else:
         raise ValueError(f"неизвестный размер пикселя: {pixel_size}")
     if palette == "custom" and not palette_colors:
         raise ValueError("для своей палитры не заданы цвета")
@@ -141,7 +159,7 @@ def make_pixel_art(
 
     # 2) размер сетки с сохранением пропорций
     width, height = framed.size
-    grid_big = min(GRID_BY_SIZE[pixel_size], max(width, height))
+    grid_big = min(grid_level, max(width, height))
     if width >= height:
         grid_w = grid_big
         grid_h = max(1, round(height * grid_big / width))
@@ -408,6 +426,7 @@ def render(
     art = make_pixel_art(
         img,
         pixel_size=settings.pixel_size,
+        custom_grid=settings.custom_grid,
         palette=settings.palette,
         n_colors=settings.n_colors,
         dither=settings.dither,

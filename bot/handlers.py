@@ -15,7 +15,7 @@ from dataclasses import replace
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
-from aiogram.filters import Command, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
@@ -46,6 +46,8 @@ from .config import (
     DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
+    GRID_MAX,
+    GRID_MIN,
     MAX_CONCURRENT_JOBS,
     MAX_FILE_SIZE,
     PADDING_RANGE,
@@ -69,6 +71,7 @@ from .pixelart import (
     encode_source,
     extract_first_frame,
     extract_palette,
+    parse_grid,
     render,
     resize_for_sticker,
 )
@@ -85,6 +88,8 @@ store = StateStore(max_entries=STATE_MAX_ENTRIES, ttl_seconds=STATE_TTL_SECONDS)
 favorites = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> Settings
 custom_palettes = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> палитра
 _palette_flow: set[int] = set()  # пользователи, ожидающие ввода своей палитры
+_grid_flow: dict[int, tuple[int, int]] = {}  # user_id -> (chat_id, message_id) цели
+_recent_entry: dict[int, tuple[int, int]] = {}  # chat_id -> последнее (chat_id, message_id)
 _jobs = asyncio.Semaphore(MAX_CONCURRENT_JOBS)  # не более 2 одновременных обработок
 _last_photo_at: dict[int, float] = {}
 _albums_seen: "OrderedDict[str, None]" = OrderedDict()
@@ -123,13 +128,16 @@ _VIEWS = ("main", "palettes", "adjust", "effects", "frame", "export")
 
 @router.message(Command("cancel"))
 async def cmd_cancel(message: Message) -> None:
-    """Отмена активного флоу (и админского, и создания своей палитры)."""
+    """Отмена активного флоу (и админского, и создания своей палитры, и сетки)."""
     if message.from_user is None:
         return
     uid = message.from_user.id
     cancelled = cancel_admin_flow(uid)
     if uid in _palette_flow:
         _palette_flow.discard(uid)
+        cancelled = True
+    if uid in _grid_flow:
+        _grid_flow.pop(uid, None)
         cancelled = True
     await message.answer("Действие отменено." if cancelled else "Нет активного действия.")
 
@@ -157,7 +165,7 @@ async def cmd_help(message: Message) -> None:
         "✨ Эффекты — обводка, CRT-сканлайны, зерно\n"
         "🖼 Кадр — ✂️ вырезать фон, 🎯 только объект, отступ\n"
         "📤 Экспорт — 🔖 запомнить стиль, 📎 PNG, 🧩 стикер 512, 💧 водяной знак\n\n"
-        "Команды: /palette, /mystyle, /demo."
+        "Команды: /palette, /mystyle, /demo, /grid N (свой уровень пикселизации)."
     )
 
 
@@ -167,6 +175,7 @@ async def cmd_palette(message: Message) -> None:
         return
     chats.touch(message.chat.id)
     _palette_flow.add(message.from_user.id)
+    _grid_flow.pop(message.from_user.id, None)
     await message.answer(
         "🎨 Пришли следующим сообщением:\n"
         "• hex-цвета через пробел/запятую: #FF004D 00E436 7E2553\n"
@@ -193,6 +202,42 @@ async def cmd_mystyle(message: Message) -> None:
     )
 
 
+@router.message(Command("grid"))
+async def cmd_grid(message: Message, bot: Bot, command: CommandObject | None = None) -> None:
+    """Свой уровень пикселизации: /grid 48 применяет к последнему результату."""
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    chats.touch(message.chat.id)
+    target = _recent_entry.get(message.chat.id)
+    args = (command.args if command else None) or ""
+    grid = parse_grid(args)
+    if grid is not None and target is not None:
+        entry = store.get(*target)
+        if entry is None:
+            await bot.send_message(message.chat.id, TEXT_STALE)
+            return
+        settings = replace(entry.settings, pixel_size="custom", custom_grid=grid)
+        ok = await _render_and_edit(bot, *target, entry, settings)
+        await bot.send_message(
+            message.chat.id, f"✅ Свой уровень: сетка {grid} px." if ok else TEXT_ERROR
+        )
+        return
+    if target is not None and store.get(*target) is not None:
+        _grid_flow[uid] = target
+        _palette_flow.discard(uid)
+        await bot.send_message(
+            message.chat.id,
+            f"📏 Пришли числом размер сетки {GRID_MIN}–{GRID_MAX} px "
+            "(меньше = крупнее пиксели). /cancel — отмена.",
+        )
+        return
+    await bot.send_message(
+        message.chat.id,
+        "Сначала пришли фото, затем /grid 48 — или кнопка «📏 Свой» под результатом.",
+    )
+
+
 @router.message(Command("demo"))
 async def cmd_demo(message: Message, bot: Bot) -> None:
     uid = _user_ok(message)
@@ -216,6 +261,7 @@ async def cmd_demo(message: Message, bot: Bot) -> None:
         reply_markup=_keyboard(settings),
     )
     store.put(message.chat.id, sent.message_id, source, settings)
+    _recent_entry[message.chat.id] = (message.chat.id, sent.message_id)
 
 
 # ---------------------------------------------------------------- свои палитры (флоу)
@@ -273,10 +319,36 @@ def _is_image_doc(document) -> bool:
     return mime.startswith("image/") or name.endswith((".jpg", ".jpeg", ".png", ".webp"))
 
 
+async def grid_capture(message: Message, bot: Bot) -> None:
+    """Перехватывает число — свой уровень пикселизации."""
+    uid = message.from_user.id if message.from_user else None
+    if uid is None or uid not in _grid_flow:
+        raise SkipHandler  # вне флоу — обычная обработка
+    grid = parse_grid(message.text or "")
+    if grid is None:
+        await message.answer(
+            f"Нужно целое число {GRID_MIN}–{GRID_MAX}. Попробуй ещё раз или /cancel."
+        )
+        return
+    target = _grid_flow.pop(uid)
+    entry = store.get(*target)
+    if entry is None:
+        await message.answer(TEXT_STALE)
+        return
+    settings = replace(entry.settings, pixel_size="custom", custom_grid=grid)
+    if await _render_and_edit(bot, *target, entry, settings):
+        await message.answer(f"✅ Свой уровень: сетка {grid} px.")
+
+
 # перехват до on_photo/on_document: сообщения пользователей в флоу своей палитры
 router.message.register(
     palette_capture,
     F.photo | F.document | (F.text & ~F.text.startswith("/")),
+)
+# перехват ввода своего уровня пикселизации (текст-число)
+router.message.register(
+    grid_capture,
+    F.text & ~F.text.startswith("/"),
 )
 
 
@@ -411,11 +483,29 @@ async def _process_new(
         reply_markup=_keyboard(settings),
     )
     store.put(message.chat.id, sent.message_id, source, settings, custom_palette=custom)
+    _recent_entry[message.chat.id] = (message.chat.id, sent.message_id)
     record_photo(uid)
-    logger.info("новое фото обработано, сетка=%s", GRID_BY_SIZE[settings.pixel_size])
+    logger.info("новое фото обработано, сетка=%s", GRID_BY_SIZE.get(settings.pixel_size, settings.custom_grid))
 
 
 # ---------------------------------------------------------------- кнопки стиля
+
+
+@router.callback_query(F.data == "size:custom")
+async def cb_size_custom(callback: CallbackQuery) -> None:
+    """«📏 Свой»: запросить у пользователя число — свой уровень пикселизации."""
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    uid = callback.from_user.id
+    _grid_flow[uid] = (loaded[0], loaded[1])
+    _palette_flow.discard(uid)
+    await callback.answer(
+        f"Пришли следующим сообщением число {GRID_MIN}–{GRID_MAX} — размер сетки в px "
+        "(меньше = крупнее пиксели)",
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data.startswith("size:"))
@@ -592,6 +682,7 @@ async def cb_demo(callback: CallbackQuery, bot: Bot) -> None:
         reply_markup=_keyboard(entry.settings),
     )
     store.put(loaded[0], sent.message_id, source, entry.settings, custom_palette=entry.custom_palette)
+    _recent_entry[loaded[0]] = (loaded[0], sent.message_id)
     await callback.answer()
 
 
@@ -835,18 +926,16 @@ async def _stale(callback: CallbackQuery) -> None:
     await callback.answer(TEXT_STALE, show_alert=True)
 
 
-async def _apply(
-    callback: CallbackQuery,
+async def _render_and_edit(
     bot: Bot,
     chat_id: int,
     message_id: int,
     entry,
     settings: Settings,
     custom_palette: tuple | None = None,
-    toast: str | None = None,
     view: str | None = None,
-) -> None:
-    """Перерисовать результат на месте (edit_message_media) и сохранить настройки."""
+) -> bool:
+    """Рендер + edit_message_media + сохранение настроек. False — не удалось."""
     if custom_palette is None:
         custom_palette = entry.custom_palette
     if view is None:
@@ -868,10 +957,28 @@ async def _apply(
             pass  # та же картинка и та же клавиатура — не ошибка
         else:
             logger.warning("edit_message_media не удался: %s", exc)
-            await callback.answer(TEXT_ERROR, show_alert=True)
-            return
+            return False
     store.put(chat_id, message_id, entry.source, settings, custom_palette=custom_palette, view=view)
-    await callback.answer(toast)
+    _recent_entry[chat_id] = (chat_id, message_id)
+    return True
+
+
+async def _apply(
+    callback: CallbackQuery,
+    bot: Bot,
+    chat_id: int,
+    message_id: int,
+    entry,
+    settings: Settings,
+    custom_palette: tuple | None = None,
+    toast: str | None = None,
+    view: str | None = None,
+) -> None:
+    """Перерисовать результат по кнопке; ответить тостом или ошибкой."""
+    if await _render_and_edit(bot, chat_id, message_id, entry, settings, custom_palette, view):
+        await callback.answer(toast)
+    else:
+        await callback.answer(TEXT_ERROR, show_alert=True)
 
 
 def _mark(text: str, active: bool) -> str:
@@ -957,15 +1064,22 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
     effects_done = settings.outline or settings.crt or settings.grain
     frame_done = settings.cut_bg or settings.crop_object or settings.padding != DEFAULT_PADDING
     export_done = settings.sticker or settings.watermark
+    size_row = [
+        InlineKeyboardButton(
+            text=_mark(SIZE_LABELS[key], settings.pixel_size == key),
+            callback_data=f"size:{key}",
+        )
+        for key in SIZE_ORDER
+    ]
+    size_row.append(
+        InlineKeyboardButton(
+            text=_mark("📏 Свой", settings.pixel_size == "custom"),
+            callback_data="size:custom",
+        )
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=_mark(SIZE_LABELS[key], settings.pixel_size == key),
-                    callback_data=f"size:{key}",
-                )
-                for key in SIZE_ORDER
-            ],
+            size_row,
             [
                 InlineKeyboardButton(text=_mark("🎨 Палитры", palette_done), callback_data="menu:palettes"),
                 InlineKeyboardButton(text=_mark("🎛 Коррекции", adjust_done), callback_data="menu:adjust"),
@@ -984,13 +1098,20 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
     )
 
 
+def _grid_label(settings: Settings) -> str:
+    """Размер сетки для подписи: пресет или свой уровень."""
+    if settings.pixel_size == "custom":
+        return f"{settings.custom_grid} px (свой)"
+    return f"{GRID_BY_SIZE[settings.pixel_size]} px"
+
+
 def _caption(settings: Settings) -> str:
     palette_label = (
         f"Авто ({settings.n_colors})" if settings.palette == "auto" else (
             "Свои" if settings.palette == "custom" else PALETTE_LABELS[settings.palette]
         )
     )
-    text = f"🎨 {GRID_BY_SIZE[settings.pixel_size]} px · {palette_label} · дизеринг {'вкл' if settings.dither else 'выкл'}"
+    text = f"🎨 {_grid_label(settings)} · {palette_label} · дизеринг {'вкл' if settings.dither else 'выкл'}"
     adjustments = []
     if settings.contrast != DEFAULT_CONTRAST:
         adjustments.append(f"контраст {settings.contrast:g}")

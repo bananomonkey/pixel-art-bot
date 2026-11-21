@@ -11,6 +11,7 @@ from dataclasses import dataclass, replace
 from .config import (
     DEFAULT_BG_TOLERANCE,
     DEFAULT_CONTRAST,
+    DEFAULT_CUSTOM_GRID,
     DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
@@ -33,7 +34,8 @@ COLOR_STEPS: tuple[int, ...] = (8, 16, 32, 64)
 class Settings:
     """Настройки пиксель-арта для одного фото."""
 
-    pixel_size: str = "medium"  # small | medium | large | huge
+    pixel_size: str = "medium"  # small | medium | large | huge | custom
+    custom_grid: int = DEFAULT_CUSTOM_GRID  # свой уровень пикселизации (8–256)
     palette: str = "auto"  # auto | gameboy | nes | pico8 | c64 | bw | bw1 | zx | sweetie | cga | custom
     n_colors: int = 16  # только для «Авто», одно из COLOR_STEPS
     dither: bool = False

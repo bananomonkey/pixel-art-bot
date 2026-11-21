@@ -4,6 +4,7 @@
 import io
 
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
 
 from bot.handlers import _keyboard
@@ -195,3 +196,57 @@ def test_store_keeps_view():
     assert store.get(1, 1).view == "palettes"
     store.put(1, 1, b"src", Settings(), view="main")
     assert store.get(1, 1).view == "main"
+
+
+# ------------------------------------------------------------------ свой уровень пикселизации
+
+
+def test_parse_grid():
+    from bot.pixelart import parse_grid
+
+    assert parse_grid("48") == 48
+    assert parse_grid(" 8 ") == 8
+    assert parse_grid("256") == 256
+    assert parse_grid("7") is None      # меньше GRID_MIN
+    assert parse_grid("257") is None    # больше GRID_MAX
+    assert parse_grid("abc") is None
+    assert parse_grid("") is None
+    assert parse_grid("12.5") is None
+    assert parse_grid("-5") is None
+
+
+def test_custom_grid_render_size():
+    img = _object_on_white()  # 300x240
+    result = make_pixel_art(img, pixel_size="custom", custom_grid=50)
+    # gw=50, gh=round(240*50/300)=40, scale=round(1024/50)=20
+    assert result.size == (1000, 800)
+
+
+def test_custom_grid_clamped():
+    small = make_pixel_art(_object_on_white(), pixel_size="custom", custom_grid=4)
+    big = make_pixel_art(_object_on_white(), pixel_size="custom", custom_grid=999)
+    # кламп в 8 и 256: обе стороны результата ~1024
+    assert max(small.size) == 1024 and max(big.size) == 1024
+
+
+def test_custom_grid_without_value_raises():
+    with pytest.raises(ValueError):
+        make_pixel_art(_object_on_white(), pixel_size="custom")
+
+
+def test_caption_custom_grid():
+    from bot.handlers import _caption
+
+    settings = Settings(pixel_size="custom", custom_grid=48)
+    assert "48 px (свой)" in _caption(settings)
+    assert "96 px" in _caption(Settings())
+
+
+def test_keyboard_has_custom_size_button():
+    kb = _keyboard(Settings(), "main")
+    size_row = kb.inline_keyboard[0]
+    assert any(b.callback_data == "size:custom" for b in size_row)
+    custom = Settings(pixel_size="custom", custom_grid=33)
+    kb = _keyboard(custom, "main")
+    labels = [b.text for b in kb.inline_keyboard[0]]
+    assert "📏 Свой ✓" in labels and "Средний" in labels  # пресет без ✓
