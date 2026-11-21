@@ -11,7 +11,10 @@ from bot.palettes import (
 )
 from bot.pixelart import _nearest_palette
 
-EXPECTED_SIZES = {"gameboy": 4, "nes": 54, "pico8": 16, "c64": 16, "bw": 8, "cga": 4}
+EXPECTED_SIZES = {
+    "gameboy": 4, "nes": 54, "pico8": 16, "c64": 16,
+    "bw": 8, "bw1": 2, "zx": 15, "sweetie": 16, "cga": 4,
+}
 
 
 def test_registry_keys():

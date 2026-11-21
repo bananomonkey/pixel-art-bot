@@ -11,13 +11,19 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 
 from .config import (
+    CRT_STEP,
+    DEFAULT_BG_TOLERANCE,
     DEFAULT_CONTRAST,
+    DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
     MAX_IMAGE_SIDE,
     RESULT_MAX_SIDE,
     SOURCE_MAX_SIDE,
+    STICKER_MAX_SIDE,
     STORAGE_JPEG_QUALITY,
+    UNIFORM_TRIM_TOLERANCE,
+    WATERMARK_TEXT,
 )
 from .palettes import FIXED_PALETTES, as_numpy
 from .state import Settings
@@ -105,10 +111,15 @@ def make_pixel_art(
     saturation: float = DEFAULT_SATURATION,
     sharpness: float = DEFAULT_SHARPNESS,
     palette_colors: tuple | None = None,
+    cut_bg: bool = False,
+    bg_tolerance: int = DEFAULT_BG_TOLERANCE,
+    crop_object: bool = False,
+    padding: int = DEFAULT_PADDING,
+    outline: bool = False,
 ) -> Image.Image:
-    """Пикселизация RGB-изображения: сетка -> квантизация -> ровные квадраты.
+    """Пикселизация RGB-изображения: фон/кадр -> сетка -> квантизация -> квадраты.
 
-    Возвращает RGB-изображение, большая сторона которого — целое кратное
+    Возвращает RGBA (при вырезке фона) или RGB, большая сторона — целое кратное
     размера сетки и близка к RESULT_MAX_SIDE. Для palette="custom" нужен
     palette_colors (своя палитра пользователя).
     """
@@ -120,8 +131,16 @@ def make_pixel_art(
         raise ValueError(f"неизвестная палитра: {palette}")
     n_colors = max(2, min(64, int(n_colors)))
 
-    # 1) размер сетки с сохранением пропорций (без апскейла сетки для крошечных фото)
-    width, height = img.size
+    # 0) коррекции контраста/насыщенности/резкости
+    adjusted = ImageEnhance.Contrast(img).enhance(contrast)
+    adjusted = ImageEnhance.Color(adjusted).enhance(saturation)
+    adjusted = ImageEnhance.Sharpness(adjusted).enhance(sharpness)
+
+    # 1) фон и кадр (возвращает RGBA)
+    framed = _frame_image(adjusted, cut_bg, bg_tolerance, crop_object, padding)
+
+    # 2) размер сетки с сохранением пропорций
+    width, height = framed.size
     grid_big = min(GRID_BY_SIZE[pixel_size], max(width, height))
     if width >= height:
         grid_w = grid_big
@@ -130,28 +149,203 @@ def make_pixel_art(
         grid_h = grid_big
         grid_w = max(1, round(width * grid_big / height))
 
-    # 2) коррекции контраста/насыщенности/резкости, затем BOX-усреднение до сетки
-    adjusted = ImageEnhance.Contrast(img).enhance(contrast)
-    adjusted = ImageEnhance.Color(adjusted).enhance(saturation)
-    adjusted = ImageEnhance.Sharpness(adjusted).enhance(sharpness)
-    small = adjusted.resize((grid_w, grid_h), Image.Resampling.BOX)
+    # 3) premultiplied BOX-усреднение до сетки (чтобы прозрачность не «замыливала» цвет)
+    src = np.asarray(framed).astype(np.float32)
+    alpha = src[..., 3:4] / 255.0
+    pre = np.concatenate([src[..., :3] * alpha, alpha * 255.0], axis=2).astype(np.uint8)
+    small_rgba = np.asarray(
+        Image.fromarray(pre, "RGBA").resize((grid_w, grid_h), Image.Resampling.BOX)
+    ).astype(np.float32)
+    a_grid = small_rgba[..., 3:4]
+    solid = a_grid[..., 0] >= 96.0  # пиксель-арт: жёсткая граница, без полупрозрачных краёв
+    rgb_grid = np.clip(small_rgba[..., :3] * (255.0 / np.maximum(a_grid, 1.0)), 0, 255)
 
-    # 3) квантизация цветов
+    # 4) квантизация (прозрачные пиксели невидимы — цвет в них не важен)
+    rgb_u8 = rgb_grid.astype(np.uint8)
+    grid_img = Image.fromarray(rgb_u8, "RGB")
     if palette == "auto":
         dither_mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
-        small = small.quantize(
+        grid_img = grid_img.quantize(
             colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=dither_mode
         ).convert("RGB")
     elif palette == "custom":
-        small = _map_to_fixed_palette(small, palette_colors, dither=dither)
+        grid_img = _map_to_fixed_palette(grid_img, palette_colors, dither=dither)
     else:
-        small = _map_to_fixed_palette(small, FIXED_PALETTES[palette], dither=dither)
+        grid_img = _map_to_fixed_palette(grid_img, FIXED_PALETTES[palette], dither=dither)
+    rgb_out = np.asarray(grid_img)
 
-    # 4) увеличение NEAREST'ом в целое число раз — пиксели остаются ровными квадратами
+    # 5) обводка по границам объекта (на сетке, до увеличения)
+    if outline:
+        rgb_out = _apply_outline(rgb_out, solid)
+
+    # 6) сборка и увеличение NEAREST'ом в целое число раз
     scale = max(1, round(RESULT_MAX_SIDE / max(grid_w, grid_h)))
-    return small.resize(
-        (grid_w * scale, grid_h * scale), Image.Resampling.NEAREST
-    )
+    if solid.all():  # прозрачности нет — возвращаем обычный RGB
+        return Image.fromarray(rgb_out, "RGB").resize(
+            (grid_w * scale, grid_h * scale), Image.Resampling.NEAREST
+        )
+    final = np.dstack([rgb_out, np.where(solid, 255, 0).astype(np.uint8)])
+    art = Image.fromarray(final, "RGBA")
+    return art.resize((grid_w * scale, grid_h * scale), Image.Resampling.NEAREST)
+
+
+# ---------------------------------------------------------------- фон и кадр
+
+
+def _flood_from_border(close: np.ndarray) -> np.ndarray:
+    """Достижимые из границы области «фонового» цвета (волновой BFS, векторно)."""
+    reached = np.zeros_like(close, dtype=bool)
+    if not close.any():
+        return reached
+    frontier = np.zeros_like(close, dtype=bool)
+    frontier[0, :] = close[0, :]
+    frontier[-1, :] = close[-1, :]
+    frontier[:, 0] = close[:, 0]
+    frontier[:, -1] = close[:, -1]
+    while frontier.any():
+        reached |= frontier
+        grow = np.zeros_like(close, dtype=bool)
+        grow[1:, :] |= frontier[:-1, :]
+        grow[:-1, :] |= frontier[1:, :]
+        grow[:, 1:] |= frontier[:, :-1]
+        grow[:, :-1] |= frontier[:, 1:]
+        frontier = grow & close & ~reached
+    return reached
+
+
+def _dilate(mask: np.ndarray) -> np.ndarray:
+    grow = np.zeros_like(mask, dtype=bool)
+    grow[1:, :] |= mask[:-1, :]
+    grow[:-1, :] |= mask[1:, :]
+    grow[:, 1:] |= mask[:, :-1]
+    grow[:, :-1] |= mask[:, 1:]
+    return mask | grow
+
+
+def _bg_color(arr: np.ndarray) -> np.ndarray:
+    """Цвет фона — медиана четырёх углов изображения."""
+    corners = np.stack([arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]]).astype(np.float64)
+    return np.median(corners, axis=0)
+
+
+def _frame_image(
+    img: Image.Image,
+    cut_bg: bool,
+    bg_tolerance: int,
+    crop_object: bool,
+    padding: int,
+) -> Image.Image:
+    """Вырезать фон (flood fill от краёв) и/или кадрировать до объекта.
+
+    Возвращает RGBA; без вырезки альфа непрозрачная.
+    """
+    arr = np.asarray(img.convert("RGB"))
+    height, width = arr.shape[:2]
+    alpha = np.full((height, width), 255, dtype=np.uint8)
+    bg = _bg_color(arr)
+    dist = np.sqrt(((arr.astype(np.float64) - bg) ** 2).sum(axis=2))
+
+    if cut_bg:
+        close = dist <= max(1, bg_tolerance)
+        # BFS на четверти разрешения — быстро даже на 4000 px
+        flooded_q = _flood_from_border(close[::4, ::4])
+        flooded = np.repeat(np.repeat(flooded_q, 4, axis=0), 4, axis=1)[:height, :width]
+        for _ in range(3):  # догнать границы на полном разрешении
+            flooded = _dilate(flooded) & close
+        alpha = np.where(flooded, 0, 255).astype(np.uint8)
+
+    if crop_object:
+        if cut_bg:
+            content = alpha > 0
+        else:
+            content = dist > UNIFORM_TRIM_TOLERANCE  # «не фон» без вырезки
+        rows = np.where(content.any(axis=1))[0]
+        cols = np.where(content.any(axis=0))[0]
+        if len(rows) and len(cols):
+            box_h = rows[-1] - rows[0] + 1
+            box_w = cols[-1] - cols[0] + 1
+            pad = int(max(0, padding) / 100 * max(box_h, box_w))
+            r0 = max(0, rows[0] - pad)
+            r1 = min(height, rows[-1] + 1 + pad)
+            c0 = max(0, cols[0] - pad)
+            c1 = min(width, cols[-1] + 1 + pad)
+            arr = arr[r0:r1, c0:c1]
+            alpha = alpha[r0:r1, c0:c1]
+
+    return Image.fromarray(np.dstack([arr, alpha]), "RGBA")
+
+
+def _apply_outline(rgb: np.ndarray, solid: np.ndarray, threshold: int = 40) -> np.ndarray:
+    """Затемнить граничные пиксели объекта (пиксельная обводка на сетке)."""
+    out = rgb.copy()
+    h, w = solid.shape
+    edge = np.zeros_like(solid, dtype=bool)
+    ints = rgb.astype(np.int16)
+    for dy, dx, a_sl, b_sl in ((0, 1, (slice(None), slice(None, -1)), (slice(None), slice(1, None))),
+                               (0, -1, (slice(None), slice(1, None)), (slice(None), slice(None, -1))),
+                               (1, 0, (slice(None, -1), slice(None)), (slice(1, None), slice(None))),
+                               (-1, 0, (slice(1, None), slice(None)), (slice(None, -1), slice(None)))):
+        diff = np.abs(ints[a_sl] - ints[b_sl]).max(axis=2) > threshold
+        boundary = solid[a_sl] != solid[b_sl]
+        mark = a_sl
+        edge[mark] |= (diff | boundary) & solid[mark]
+    out[edge] = (out[edge].astype(np.float32) * 0.45).astype(np.uint8)
+    return out
+
+
+# ---------------------------------------------------------------- эффекты и экспорт
+
+
+def post_effects(
+    img: Image.Image,
+    crt: bool = False,
+    grain: bool = False,
+    watermark_text: str | None = None,
+) -> Image.Image:
+    """Эффекты поверх увеличенного результата: сканлайны, зерно, водяной знак."""
+    if not crt and not grain and not watermark_text:
+        return img
+    from PIL import ImageDraw, ImageFont
+
+    had_alpha = img.mode == "RGBA"
+    if not had_alpha:
+        img = img.convert("RGBA")
+    arr = np.asarray(img).copy()
+    if crt:
+        arr[3::CRT_STEP, :, :3] = (arr[3::CRT_STEP, :, :3].astype(np.float32) * 0.72).astype(np.uint8)
+    if grain:
+        noise = np.random.normal(0.0, 9.0, arr[..., :3].shape)
+        arr[..., :3] = np.clip(arr[..., :3] + noise, 0, 255).astype(np.uint8)
+    result = Image.fromarray(arr, "RGBA")
+    if watermark_text:
+        font_size = max(12, result.width // 28)
+        font = ImageFont.load_default(size=font_size)
+        layer = Image.new("RGBA", result.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        box = draw.textbbox((0, 0), watermark_text, font=font)
+        text_w, text_h = box[2] - box[0], box[3] - box[1]
+        x = max(0, result.width - text_w - font_size // 2)
+        y = max(0, result.height - text_h - font_size // 2)
+        draw.text((x + 1, y + 1), watermark_text, font=font, fill=(0, 0, 0, 150))
+        draw.text((x, y), watermark_text, font=font, fill=(255, 255, 255, 200))
+        result = Image.alpha_composite(result, layer)
+    if not had_alpha:
+        return result.convert("RGB")
+    return result
+
+
+def resize_for_sticker(png_bytes: bytes, max_side: int = STICKER_MAX_SIDE) -> bytes:
+    """Уменьшить PNG до стикер-размера (большая сторона 512), NEAREST."""
+    img = Image.open(io.BytesIO(png_bytes))
+    scale = max_side / max(img.size)
+    if scale < 1.0:
+        img = img.resize(
+            (max(1, round(img.width * scale)), max(1, round(img.height * scale))),
+            Image.Resampling.NEAREST,
+        )
+    buffer = io.BytesIO()
+    img.save(buffer, "PNG", optimize=True)
+    return buffer.getvalue()
 
 
 def _map_to_fixed_palette(img: Image.Image, colors: tuple, dither: bool) -> Image.Image:
@@ -199,8 +393,17 @@ def _bayer_offsets(width: int, height: int) -> np.ndarray:
 # ---------------------------------------------------------------- рендер результата
 
 
-def render(source: bytes, settings: Settings, custom_palette: tuple | None = None) -> bytes:
-    """Собрать PNG результата из сжатого исходника по настройкам."""
+def render(
+    source: bytes,
+    settings: Settings,
+    custom_palette: tuple | None = None,
+    flatten: bool = False,
+) -> bytes:
+    """Собрать PNG результата из сжатого исходника по настройкам.
+
+    flatten=True (для отправки фото) — прозрачность заливается белым,
+    иначе PNG сохраняет альфу (для «📎 PNG» и стикера).
+    """
     img = Image.open(io.BytesIO(source)).convert("RGB")
     art = make_pixel_art(
         img,
@@ -212,7 +415,22 @@ def render(source: bytes, settings: Settings, custom_palette: tuple | None = Non
         saturation=settings.saturation,
         sharpness=settings.sharpness,
         palette_colors=custom_palette,
+        cut_bg=settings.cut_bg,
+        bg_tolerance=settings.bg_tolerance,
+        crop_object=settings.crop_object,
+        padding=settings.padding,
+        outline=settings.outline,
     )
+    art = post_effects(
+        art,
+        crt=settings.crt,
+        grain=settings.grain,
+        watermark_text=WATERMARK_TEXT if settings.watermark else None,
+    )
+    if flatten and art.mode == "RGBA":
+        background = Image.new("RGB", art.size, (255, 255, 255))
+        background.paste(art, mask=art.getchannel("A"))
+        art = background
     buffer = io.BytesIO()
     art.save(buffer, "PNG", optimize=True)
     return buffer.getvalue()

@@ -65,3 +65,17 @@ SATURATION_RANGE = (0.4, 2.2)
 SHARPNESS_RANGE = (0.5, 3.0)
 ADJUSTMENT_STEP = 0.2  # контраст и насыщенность
 SHARPNESS_STEP = 0.25  # резкость
+
+# --- фон и кадр ---
+DEFAULT_BG_TOLERANCE = 48  # евклидово RGB-расстояние до цвета фона
+BG_TOLERANCE_RANGE = (16, 160)
+BG_TOLERANCE_STEP = 16
+DEFAULT_PADDING = 10  # отступ вокруг объекта, % от большей стороны bbox
+PADDING_RANGE = (0, 40)
+PADDING_STEP = 5
+UNIFORM_TRIM_TOLERANCE = 16  # для авто-кадра без вырезки фона
+
+# --- эффекты и экспорт ---
+CRT_STEP = 4  # сканлайн каждые N строк результата
+STICKER_MAX_SIDE = 512
+WATERMARK_TEXT = os.getenv("WATERMARK_TEXT", "@pixelartphoto_bot")

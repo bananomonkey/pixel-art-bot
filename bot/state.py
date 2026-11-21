@@ -8,7 +8,13 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 
-from .config import DEFAULT_CONTRAST, DEFAULT_SATURATION, DEFAULT_SHARPNESS
+from .config import (
+    DEFAULT_BG_TOLERANCE,
+    DEFAULT_CONTRAST,
+    DEFAULT_PADDING,
+    DEFAULT_SATURATION,
+    DEFAULT_SHARPNESS,
+)
 
 # --- уровни размера пикселя: сетка по большей стороне ---
 SIZE_ORDER: tuple[str, ...] = ("small", "medium", "large", "huge")
@@ -28,12 +34,24 @@ class Settings:
     """Настройки пиксель-арта для одного фото."""
 
     pixel_size: str = "medium"  # small | medium | large | huge
-    palette: str = "auto"  # auto | gameboy | nes | pico8 | c64 | bw | cga | custom
+    palette: str = "auto"  # auto | gameboy | nes | pico8 | c64 | bw | bw1 | zx | sweetie | cga | custom
     n_colors: int = 16  # только для «Авто», одно из COLOR_STEPS
     dither: bool = False
     contrast: float = DEFAULT_CONTRAST
     saturation: float = DEFAULT_SATURATION
     sharpness: float = DEFAULT_SHARPNESS
+    # кадр и фон
+    cut_bg: bool = False  # вырезать фон (flood fill от краёв)
+    bg_tolerance: int = DEFAULT_BG_TOLERANCE  # порог схожести с фоном
+    crop_object: bool = False  # «только объект»: кадрирование по контенту
+    padding: int = DEFAULT_PADDING  # отступ вокруг объекта, %
+    # эффекты
+    outline: bool = False  # обводка объекта
+    crt: bool = False  # сканлайны
+    grain: bool = False  # зерно
+    # экспорт
+    sticker: bool = False  # «📎 PNG» отдаёт стикер 512 px
+    watermark: bool = False  # подпись бота на результате
 
 
 def with_changes(settings: Settings, **changes) -> Settings:
@@ -46,13 +64,15 @@ class Entry:
     """Запись состояния: подготовленный исходник + текущие настройки.
 
     custom_palette — снимок своей палитры автора (нужен для перерисовки
-    кнопками, если автор выбрал режим «Свои»).
+    кнопками, если автор выбрал режим «Свои»). view — открытая категория
+    клавиатуры (возврат после перерисовки в то же подменю).
     """
 
     source: bytes  # исходник, уменьшенный и сжатый (JPEG), только в памяти
     settings: Settings
     updated_at: float
     custom_palette: tuple | None = None
+    view: str = "main"
 
 
 class StateStore:
@@ -74,6 +94,7 @@ class StateStore:
         source: bytes,
         settings: Settings,
         custom_palette: tuple | None = None,
+        view: str = "main",
     ) -> None:
         """Сохранить/обновить запись и поднять её наверх LRU."""
         key = (chat_id, message_id)
@@ -84,6 +105,7 @@ class StateStore:
             settings=settings,
             updated_at=time.monotonic(),
             custom_palette=custom_palette,
+            view=view,
         )
         while len(self._entries) > self._max_entries:
             self._entries.popitem(last=False)  # вытеснить наименее давнюю

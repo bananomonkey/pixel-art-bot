@@ -38,17 +38,23 @@ from .admin import (
 )
 from .config import (
     ADJUSTMENT_STEP,
+    BG_TOLERANCE_RANGE,
+    BG_TOLERANCE_STEP,
+    CONTRAST_RANGE,
+    DEFAULT_BG_TOLERANCE,
     DEFAULT_CONTRAST,
+    DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
     MAX_CONCURRENT_JOBS,
     MAX_FILE_SIZE,
+    PADDING_RANGE,
+    PADDING_STEP,
     PALETTE_MAX_COLORS,
     RATE_LIMIT_SECONDS,
     SATURATION_RANGE,
     SHARPNESS_RANGE,
     SHARPNESS_STEP,
-    CONTRAST_RANGE,
     STATE_MAX_ENTRIES,
     STATE_TTL_SECONDS,
     USER_STORE_MAX_ENTRIES,
@@ -64,6 +70,7 @@ from .pixelart import (
     extract_first_frame,
     extract_palette,
     render,
+    resize_for_sticker,
 )
 from .state import COLOR_STEPS, PerUserStore, SIZE_LABELS, SIZE_ORDER, Settings, StateStore
 
@@ -103,6 +110,12 @@ _ADJUSTMENTS = {
     "sat": ("saturation", SATURATION_RANGE, ADJUSTMENT_STEP, DEFAULT_SATURATION),
     "shp": ("sharpness", SHARPNESS_RANGE, SHARPNESS_STEP, DEFAULT_SHARPNESS),
 }
+# корректируемые кнопками ± целочисленные параметры кадра
+_FRAME_STEPS = {
+    "bgtol": ("bg_tolerance", BG_TOLERANCE_RANGE, BG_TOLERANCE_STEP, DEFAULT_BG_TOLERANCE, ""),
+    "pad": ("padding", PADDING_RANGE, PADDING_STEP, DEFAULT_PADDING, "%"),
+}
+_VIEWS = ("main", "palettes", "adjust", "effects", "frame", "export")
 
 
 # ---------------------------------------------------------------- команды
@@ -137,14 +150,14 @@ async def cmd_help(message: Message) -> None:
     await message.answer(
         "Как пользоваться:\n"
         "1. Пришли фото, стикер или GIF (выйдет первый кадр).\n"
-        "2. Получишь пиксель-арт с настройками по умолчанию.\n"
-        "3. Меняй стиль кнопками под фото — картинка перерисуется на месте.\n\n"
-        "Команды:\n"
-        "/palette — своя палитра: hex-цвета или фото (16 основных цветов)\n"
-        "/mystyle — показать/сбросить сохранённый стиль\n"
-        "/demo — попробовать на тестовой картинке\n\n"
-        "Палитры: Авто (8–64 цвета), Game Boy, NES, PICO-8, C64, Ч/Б, CGA, Свои.\n"
-        "«📎 Скачать PNG» отправляет файл без пережатия Telegram."
+        "2. Получишь пиксель-арт; под ним — кнопки-категории.\n\n"
+        "Категории кнопок:\n"
+        "🎨 Палитры — Авто, Game Boy, NES, PICO-8, C64, Ч/Б, 1-bit, ZX, Sweetie, CGA, Свои\n"
+        "🎛 Коррекции — дизеринг, контраст, насыщенность, резкость\n"
+        "✨ Эффекты — обводка, CRT-сканлайны, зерно\n"
+        "🖼 Кадр — ✂️ вырезать фон, 🎯 только объект, отступ\n"
+        "📤 Экспорт — 🔖 запомнить стиль, 📎 PNG, 🧩 стикер 512, 💧 водяной знак\n\n"
+        "Команды: /palette, /mystyle, /demo."
     )
 
 
@@ -490,6 +503,7 @@ async def cb_adjust_reset(callback: CallbackQuery, bot: Bot) -> None:
     chat_id, message_id, entry = loaded
     settings = replace(
         entry.settings,
+        dither=False,
         contrast=DEFAULT_CONTRAST,
         saturation=DEFAULT_SATURATION,
         sharpness=DEFAULT_SHARPNESS,
@@ -589,12 +603,24 @@ async def cb_download(callback: CallbackQuery, bot: Bot) -> None:
         return
     chat_id, _message_id, entry = loaded
     async with _jobs:
-        png = await asyncio.to_thread(render, entry.source, entry.settings, entry.custom_palette)
-    await bot.send_document(
-        chat_id,
-        BufferedInputFile(png, filename=_filename(entry.settings)),
-        caption="📎 PNG без сжатия",
-    )
+        png = await asyncio.to_thread(
+            render, entry.source, entry.settings, entry.custom_palette, flatten=False
+        )
+        if entry.settings.sticker:
+            png = await asyncio.to_thread(resize_for_sticker, png)
+    if entry.settings.sticker:
+        await bot.send_document(
+            chat_id,
+            BufferedInputFile(png, filename="pixel_sticker.png"),
+            caption="🧩 Стикер 512 px"
+            + (" с прозрачным фоном" if entry.settings.cut_bg else ""),
+        )
+    else:
+        await bot.send_document(
+            chat_id,
+            BufferedInputFile(png, filename=_filename(entry.settings)),
+            caption="📎 PNG без сжатия",
+        )
     await callback.answer()
 
 
@@ -612,6 +638,124 @@ async def cb_random(callback: CallbackQuery, bot: Bot) -> None:
         pixel_size=random.choice([key for key in SIZE_ORDER if key != current.pixel_size]),
     )
     await _apply(callback, bot, chat_id, message_id, entry, settings)
+
+
+# ---------------------------------------------------------------- категории клавиатуры
+
+
+@router.callback_query(F.data.startswith("menu:"))
+async def cb_menu(callback: CallbackQuery, bot: Bot) -> None:
+    """Открыть категорию — перерисовывается только клавиатура, без рендера."""
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    view = (callback.data or "").split(":", 1)[1]
+    if view not in _VIEWS:
+        await callback.answer()
+        return
+    try:
+        await bot.edit_reply_markup(
+            chat_id=chat_id, message_id=message_id, reply_markup=_keyboard(entry.settings, view)
+        )
+    except TelegramBadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            logger.warning("edit_reply_markup не удался: %s", exc)
+            await callback.answer(TEXT_ERROR, show_alert=True)
+            return
+    store.put(chat_id, message_id, entry.source, entry.settings, custom_palette=entry.custom_palette, view=view)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("eff:"))
+async def cb_effect(callback: CallbackQuery, bot: Bot) -> None:
+    """Переключатели эффектов: обводка, CRT, зерно."""
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    kind = (callback.data or "").split(":", 1)[-1]
+    field = {"outline": "outline", "crt": "crt", "grain": "grain"}.get(kind)
+    if field is None:
+        await callback.answer()
+        return
+    settings = replace(entry.settings, **{field: not getattr(entry.settings, field)})
+    await _apply(callback, bot, chat_id, message_id, entry, settings)
+
+
+@router.callback_query(F.data.startswith("frame:"))
+async def cb_frame(callback: CallbackQuery, bot: Bot) -> None:
+    """Кадр и фон: вырезка, объект, порог и отступ кнопками ±."""
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    action = (callback.data or "").split(":", 1)[-1]
+    if action == "cutbg":
+        settings = replace(entry.settings, cut_bg=not entry.settings.cut_bg)
+        await _apply(callback, bot, chat_id, message_id, entry, settings)
+        return
+    if action == "crop":
+        settings = replace(entry.settings, crop_object=not entry.settings.crop_object)
+        await _apply(callback, bot, chat_id, message_id, entry, settings)
+        return
+    parts = action.split(":")
+    if len(parts) == 2 and parts[0] in _FRAME_STEPS:
+        field, (lo, hi), step, default, _suffix = _FRAME_STEPS[parts[0]]
+        current = getattr(entry.settings, field)
+        new_value = int(max(lo, min(hi, current + (step if parts[1] == "p" else -step))))
+        if new_value == current:
+            await callback.answer("Предел достигнут", show_alert=True)
+            return
+        settings = replace(entry.settings, **{field: new_value})
+        await _apply(callback, bot, chat_id, message_id, entry, settings)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("export:"))
+async def cb_export(callback: CallbackQuery, bot: Bot) -> None:
+    """Экспорт: стикер (способ доставки) и водяной знак (на результат)."""
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    action = (callback.data or "").split(":", 1)[-1]
+    if action == "sticker":
+        settings = replace(entry.settings, sticker=not entry.settings.sticker)
+        store.put(chat_id, message_id, entry.source, settings,
+                  custom_palette=entry.custom_palette, view=entry.view)
+        await bot.edit_reply_markup(
+            chat_id=chat_id, message_id=message_id,
+            reply_markup=_keyboard(settings, entry.view),
+        )
+        await callback.answer(
+            "🧩 Стикер включён: «📎 PNG» отдаст файл 512 px"
+            + (" с прозрачным фоном" if settings.cut_bg else "")
+        )
+        return
+    if action == "watermark":
+        settings = replace(entry.settings, watermark=not entry.settings.watermark)
+        await _apply(callback, bot, chat_id, message_id, entry, settings)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data == "reset_all")
+async def cb_reset_all(callback: CallbackQuery, bot: Bot) -> None:
+    """Полный сброс настроек к значениям по умолчанию."""
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    fresh = Settings()
+    await _apply(callback, bot, chat_id, message_id, entry, fresh, view="main",
+                 toast="Все настройки сброшены")
 
 
 # ---------------------------------------------------------------- инлайн-режим
@@ -700,12 +844,15 @@ async def _apply(
     settings: Settings,
     custom_palette: tuple | None = None,
     toast: str | None = None,
+    view: str | None = None,
 ) -> None:
     """Перерисовать результат на месте (edit_message_media) и сохранить настройки."""
     if custom_palette is None:
         custom_palette = entry.custom_palette
+    if view is None:
+        view = entry.view
     async with _jobs:
-        png = await asyncio.to_thread(render, entry.source, settings, custom_palette)
+        png = await asyncio.to_thread(render, entry.source, settings, custom_palette, flatten=True)
     try:
         await bot.edit_message_media(
             chat_id=chat_id,
@@ -714,7 +861,7 @@ async def _apply(
                 media=BufferedInputFile(png, filename="pixel_art.png"),
                 caption=_caption(settings),
             ),
-            reply_markup=_keyboard(settings),
+            reply_markup=_keyboard(settings, view),
         )
     except TelegramBadRequest as exc:
         if "not modified" in str(exc).lower():
@@ -723,67 +870,116 @@ async def _apply(
             logger.warning("edit_message_media не удался: %s", exc)
             await callback.answer(TEXT_ERROR, show_alert=True)
             return
-    store.put(chat_id, message_id, entry.source, settings, custom_palette=custom_palette)
+    store.put(chat_id, message_id, entry.source, settings, custom_palette=custom_palette, view=view)
     await callback.answer(toast)
 
 
-def _keyboard(settings: Settings) -> InlineKeyboardMarkup:
-    """Inline-клавиатура стиля с пометками ✓ у выбранных значений."""
-    def mark(text: str, active: bool) -> str:
-        return f"{text} ✓" if active else text
+def _mark(text: str, active: bool) -> str:
+    return f"{text} ✓" if active else text
 
-    size_row = [
-        InlineKeyboardButton(
-            text=mark(SIZE_LABELS[key], settings.pixel_size == key),
-            callback_data=f"size:{key}",
+
+def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
+    """Клавиатура-категории: главный экран и подменю с «⬅️ В меню»."""
+    back = [[InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:main")]]
+    if view == "palettes":
+        labels = []
+        for key in [*PALETTE_ORDER, "custom"]:
+            if key == "auto":
+                label = f"Авто ({settings.n_colors})"
+            elif key == "custom":
+                label = "Свои"
+            else:
+                label = PALETTE_LABELS[key]
+            labels.append((_mark(label, settings.palette == key), key))
+        keyboard = [
+            [InlineKeyboardButton(text=text, callback_data=f"pal:{key}") for text, key in labels[i : i + 3]]
+            for i in range(0, len(labels), 3)
+        ]
+        keyboard.append([
+            InlineKeyboardButton(text="Больше цветов", callback_data="more"),
+            InlineKeyboardButton(text="Меньше цветов", callback_data="less"),
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=keyboard + back)
+    if view == "adjust":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(
+                    text=f"Дизеринг: {'вкл' if settings.dither else 'выкл'}", callback_data="dither")],
+                [InlineKeyboardButton(text="Контраст −", callback_data="adj:con:m"),
+                 InlineKeyboardButton(text="Контраст +", callback_data="adj:con:p")],
+                [InlineKeyboardButton(text="Насыщ −", callback_data="adj:sat:m"),
+                 InlineKeyboardButton(text="Насыщ +", callback_data="adj:sat:p")],
+                [InlineKeyboardButton(text="Резк −", callback_data="adj:shp:m"),
+                 InlineKeyboardButton(text="Резк +", callback_data="adj:shp:p")],
+                [InlineKeyboardButton(text="↺ Сброс корр.", callback_data="adj_reset")],
+                *back,
+            ]
         )
-        for key in SIZE_ORDER
-    ]
-    palette_row = []
-    for key in PALETTE_ORDER:
-        label = f"Авто ({settings.n_colors})" if key == "auto" else PALETTE_LABELS[key]
-        palette_row.append(
-            InlineKeyboardButton(
-                text=mark(label, settings.palette == key),
-                callback_data=f"pal:{key}",
-            )
+    if view == "effects":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=_mark("Обводка", settings.outline), callback_data="eff:outline"),
+                 InlineKeyboardButton(text=_mark("CRT", settings.crt), callback_data="eff:crt"),
+                 InlineKeyboardButton(text=_mark("Зерно", settings.grain), callback_data="eff:grain")],
+                *back,
+            ]
         )
-    palette_row.append(
-        InlineKeyboardButton(text=mark("Свои", settings.palette == "custom"), callback_data="pal:custom")
+    if view == "frame":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=_mark("✂️ Вырезать фон", settings.cut_bg), callback_data="frame:cutbg"),
+                 InlineKeyboardButton(text=_mark("🎯 Объект", settings.crop_object), callback_data="frame:crop")],
+                [InlineKeyboardButton(text=f"Порог {settings.bg_tolerance} −", callback_data="frame:bgtol:m"),
+                 InlineKeyboardButton(text=f"Порог {settings.bg_tolerance} +", callback_data="frame:bgtol:p")],
+                [InlineKeyboardButton(text=f"Отступ {settings.padding}% −", callback_data="frame:pad:m"),
+                 InlineKeyboardButton(text=f"Отступ {settings.padding}% +", callback_data="frame:pad:p")],
+                *back,
+            ]
+        )
+    if view == "export":
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔖 Запомнить", callback_data="fav_save"),
+                 InlineKeyboardButton(text="📎 PNG", callback_data="download")],
+                [InlineKeyboardButton(text=_mark("🧩 Стикер 512", settings.sticker), callback_data="export:sticker"),
+                 InlineKeyboardButton(text=_mark("💧 Водяной знак", settings.watermark), callback_data="export:watermark")],
+                *back,
+            ]
+        )
+    # main
+    palette_done = settings.palette != "auto" or settings.n_colors != 16
+    adjust_done = (
+        settings.dither
+        or settings.contrast != DEFAULT_CONTRAST
+        or settings.saturation != DEFAULT_SATURATION
+        or settings.sharpness != DEFAULT_SHARPNESS
     )
-    options_row = [
-        InlineKeyboardButton(
-            text=f"Дизеринг: {'вкл' if settings.dither else 'выкл'}",
-            callback_data="dither",
-        ),
-        InlineKeyboardButton(text="Больше цветов", callback_data="more"),
-        InlineKeyboardButton(text="Меньше цветов", callback_data="less"),
-    ]
-    contrast_row = [
-        InlineKeyboardButton(text="Контраст −", callback_data="adj:con:m"),
-        InlineKeyboardButton(text="Контраст +", callback_data="adj:con:p"),
-        InlineKeyboardButton(text="Насыщ −", callback_data="adj:sat:m"),
-        InlineKeyboardButton(text="Насыщ +", callback_data="adj:sat:p"),
-    ]
-    sharp_row = [
-        InlineKeyboardButton(text="Резк −", callback_data="adj:shp:m"),
-        InlineKeyboardButton(text="Резк +", callback_data="adj:shp:p"),
-        InlineKeyboardButton(text="🔖 Запомнить", callback_data="fav_save"),
-        InlineKeyboardButton(text="🎲 Демо", callback_data="demo"),
-    ]
-    actions_row = [
-        InlineKeyboardButton(text="📎 Скачать PNG", callback_data="download"),
-        InlineKeyboardButton(text="🎲 Другой стиль", callback_data="random"),
-        InlineKeyboardButton(text="↺ Сброс корр.", callback_data="adj_reset"),
-    ]
+    effects_done = settings.outline or settings.crt or settings.grain
+    frame_done = settings.cut_bg or settings.crop_object or settings.padding != DEFAULT_PADDING
+    export_done = settings.sticker or settings.watermark
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            size_row,
-            palette_row,
-            options_row,
-            contrast_row,
-            sharp_row,
-            actions_row,
+            [
+                InlineKeyboardButton(
+                    text=_mark(SIZE_LABELS[key], settings.pixel_size == key),
+                    callback_data=f"size:{key}",
+                )
+                for key in SIZE_ORDER
+            ],
+            [
+                InlineKeyboardButton(text=_mark("🎨 Палитры", palette_done), callback_data="menu:palettes"),
+                InlineKeyboardButton(text=_mark("🎛 Коррекции", adjust_done), callback_data="menu:adjust"),
+                InlineKeyboardButton(text=_mark("✨ Эффекты", effects_done), callback_data="menu:effects"),
+            ],
+            [
+                InlineKeyboardButton(text=_mark("🖼 Кадр", frame_done), callback_data="menu:frame"),
+                InlineKeyboardButton(text=_mark("📤 Экспорт", export_done), callback_data="menu:export"),
+                InlineKeyboardButton(text="🎲 Другой стиль", callback_data="random"),
+            ],
+            [
+                InlineKeyboardButton(text="🎲 Демо", callback_data="demo"),
+                InlineKeyboardButton(text="↺ Сброс", callback_data="reset_all"),
+            ],
         ]
     )
 
