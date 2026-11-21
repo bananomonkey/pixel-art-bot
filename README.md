@@ -75,7 +75,7 @@ BOT_TOKEN=123456:ABC-DEF python main.py
 
 1. Создай бота у @BotFather и получи токен.
 2. Склонируй репозиторий на сервере:
-   `git clone https://github.com/banomkey/pixel-art-bot.git && cd pixel-art-bot`
+   `git clone https://github.com/bananomonkey/pixel-art-bot.git && cd pixel-art-bot`
 3. Установи зависимости:
    `pip install -r requirements.txt` (рекомендуется venv, Python 3.11+).
 4. Задай токен и запусти: `BOT_TOKEN=<токен> python main.py`
