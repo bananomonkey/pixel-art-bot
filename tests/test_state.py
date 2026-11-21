@@ -1,8 +1,8 @@
-"""Тесты хранилища состояния: LRU-вытеснение и TTL."""
+"""Тесты хранилищ состояния: настройки (LRU+TTL) и реестр чатов (LRU)."""
 
 import time
 
-from bot.state import COLOR_STEPS, Settings, StateStore, with_changes
+from bot.state import COLOR_STEPS, ChatsRegistry, Settings, StateStore, with_changes
 
 
 def test_put_get_roundtrip():
@@ -93,3 +93,34 @@ def test_settings_defaults_and_changes():
 
 def test_color_steps_row():
     assert COLOR_STEPS == (8, 16, 32, 64)
+
+
+# ------------------------------------------------------------------ ChatsRegistry
+
+
+def test_chats_registry_touch_dedup():
+    registry = ChatsRegistry()
+    registry.touch(100)
+    registry.touch(200)
+    registry.touch(100)  # дубликат — остаётся один
+    assert sorted(registry.chat_ids()) == [100, 200]
+    assert len(registry) == 2
+
+
+def test_chats_registry_remove():
+    registry = ChatsRegistry()
+    registry.touch(100)
+    registry.remove(100)
+    assert registry.chat_ids() == []
+    registry.remove(100)  # повторно — без ошибок
+
+
+def test_chats_registry_lru_eviction():
+    registry = ChatsRegistry(max_entries=3)
+    for chat_id in (1, 2, 3):
+        registry.touch(chat_id)
+    registry.touch(1)  # поднимаем (1) наверх
+    registry.touch(4)  # вытесняется (2) — самый давний
+    assert 2 not in registry.chat_ids()
+    assert set(registry.chat_ids()) == {1, 3, 4}
+    assert len(registry) == 3

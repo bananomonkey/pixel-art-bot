@@ -25,6 +25,7 @@ from aiogram.types import (
     Message,
 )
 
+from .admin import chats, register_admin_handlers, stats
 from .config import (
     MAX_CONCURRENT_JOBS,
     MAX_FILE_SIZE,
@@ -45,6 +46,9 @@ from .state import COLOR_STEPS, SIZE_LABELS, SIZE_ORDER, Settings, StateStore
 
 logger = logging.getLogger(__name__)
 router = Router()
+# админ-хэндлеры (/admin, /cancel, перехват поста) — в начале цепочки,
+# чтобы фото админа во время создания рассылки не уходило в пикселизацию
+register_admin_handlers(router)
 
 # --- общие singleton'ы в памяти процесса ---
 store = StateStore(max_entries=STATE_MAX_ENTRIES, ttl_seconds=STATE_TTL_SECONDS)
@@ -70,6 +74,7 @@ TEXT_COLORS_MIN = "Минимум — 8 цветов"
 
 @router.message(CommandStart())
 async def cmd_start(message: Message) -> None:
+    chats.touch(message.chat.id)
     await message.answer(
         "Пришли фото — сразу верну пиксель-арт 🎨\n\n"
         "Под результатом кнопки: размер пикселя, палитра, дизеринг, "
@@ -97,6 +102,7 @@ async def cmd_help(message: Message) -> None:
 async def on_photo(message: Message, bot: Bot) -> None:
     if message.from_user is None:
         return
+    chats.touch(message.chat.id)
     album = False
     if message.media_group_id is not None:
         album = _claim_album(message.media_group_id)
@@ -114,6 +120,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
 async def on_document(message: Message, bot: Bot) -> None:
     if message.from_user is None:
         return
+    chats.touch(message.chat.id)
     document = message.document
     name = (document.file_name or "").lower()
     mime = document.mime_type or ""
@@ -175,6 +182,7 @@ async def _process_new(message: Message, bot: Bot, data: bytes, *, album: bool) 
         reply_markup=_keyboard(settings),
     )
     store.put(message.chat.id, sent.message_id, source, settings)
+    stats["photos"] += 1
     logger.info("новое фото обработано, сетка=%s", GRID_BY_SIZE[settings.pixel_size])
 
 
@@ -301,6 +309,7 @@ def _load(callback: CallbackQuery):
     message = callback.message
     if not isinstance(message, Message):
         return None
+    chats.touch(message.chat.id)
     entry = store.get(message.chat.id, message.message_id)
     if entry is None:
         return None

@@ -1,4 +1,4 @@
-"""Точка входа pixel-art-bot: long polling, только переменная окружения BOT_TOKEN."""
+"""Точка входа pixel-art-bot: long polling, переменные окружения BOT_TOKEN и ADMIN_IDS."""
 
 import asyncio
 import logging
@@ -8,21 +8,22 @@ import sys
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
+from bot.admin import broadcast_worker
 from bot.handlers import periodic_purge, router
 
-_purge_task: asyncio.Task | None = None
+_tasks: list[asyncio.Task] = []
 
 
 async def _on_startup(bot: Bot) -> None:
-    global _purge_task
-    _purge_task = asyncio.create_task(periodic_purge())
+    _tasks.append(asyncio.create_task(periodic_purge()))
+    _tasks.append(asyncio.create_task(broadcast_worker(bot)))
     logging.info("бот запущен (long polling)")
 
 
 async def _on_shutdown(bot: Bot) -> None:
-    if _purge_task is not None:
-        _purge_task.cancel()
-        _purge_task = None
+    for task in _tasks:
+        task.cancel()
+    _tasks.clear()
     logging.info("бот остановлен")
 
 

@@ -94,3 +94,34 @@ class StateStore:
 
     def __len__(self) -> int:
         return len(self._entries)
+
+
+class ChatsRegistry:
+    """LRU-реестр чатов, которые общались с ботом (для рассылок админом).
+
+    Только в памяти процесса: после перезапуска реестр пуст.
+    chat_id хранится без содержимого переписки.
+    """
+
+    def __init__(self, max_entries: int = 10_000):
+        self._max_entries = max_entries
+        self._chats: "OrderedDict[int, None]" = OrderedDict()
+
+    def touch(self, chat_id: int) -> None:
+        """Отметить чат как активный (поднимает его наверх LRU)."""
+        if chat_id in self._chats:
+            self._chats.move_to_end(chat_id)
+        self._chats[chat_id] = None
+        while len(self._chats) > self._max_entries:
+            self._chats.popitem(last=False)
+
+    def remove(self, chat_id: int) -> None:
+        """Удалить чат (например, бот заблокирован пользователем)."""
+        self._chats.pop(chat_id, None)
+
+    def chat_ids(self) -> list[int]:
+        """Список активных чатов."""
+        return list(self._chats.keys())
+
+    def __len__(self) -> int:
+        return len(self._chats)
