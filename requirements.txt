@@ -1,0 +1,4 @@
+aiogram>=3.0
+Pillow
+numpy
+# для тестов: pip install pytest
