@@ -12,9 +12,7 @@ from PIL import Image, ImageDraw, ImageEnhance, ImageOps
 
 from .config import (
     CRT_STEP,
-    DEFAULT_BG_TOLERANCE,
     DEFAULT_CONTRAST,
-    DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
     GRID_MAX,
@@ -69,12 +67,12 @@ class UnsupportedMediaError(PixelArtError):
 # ---------------------------------------------------------------- исходник
 
 
-def decode_source(data: bytes) -> Image.Image:
+def decode_source(data: bytes, keep_alpha: bool = False) -> Image.Image:
     """Открыть присланное фото и подготовить исходник.
 
-    Проверяет ограничения (4000x4000), выпрямляет по EXIF, прозрачность
-    заливает белым, уменьшает до SOURCE_MAX_SIDE по большей стороне.
-    Метаданные (EXIF и прочее) не переносятся.
+    Проверяет ограничения (4000x4000), выпрямляет по EXIF, уменьшает до
+    SOURCE_MAX_SIDE. По умолчанию прозрачность заливается белым; keep_alpha=True
+    (для ассет-паков) сохраняет альфа-канал. Метаданные не переносятся.
     """
     try:
         img = Image.open(io.BytesIO(data))
@@ -84,7 +82,7 @@ def decode_source(data: bytes) -> Image.Image:
         if max(img.size) > MAX_IMAGE_SIDE:
             raise ImageTooLargeError("изображение больше 4000x4000")
         img = ImageOps.exif_transpose(img)
-        img = _flatten_to_rgb(img)
+        img = _flatten_to_rgb(img, keep_alpha=keep_alpha)
         img.thumbnail((SOURCE_MAX_SIDE, SOURCE_MAX_SIDE), Image.Resampling.LANCZOS)
         return img
     except (ImageTooLargeError, UnsupportedMediaError):
@@ -93,13 +91,17 @@ def decode_source(data: bytes) -> Image.Image:
         raise UnsupportedMediaError(f"не удалось открыть изображение: {type(exc).__name__}") from exc
 
 
-def _flatten_to_rgb(img: Image.Image) -> Image.Image:
-    """Привести к RGB; прозрачность PNG/LA/P — залить белым."""
+def _flatten_to_rgb(img: Image.Image, keep_alpha: bool = False) -> Image.Image:
+    """Привести к RGB (прозрачность — залить белым) или к RGBA при keep_alpha."""
     if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
         rgba = img.convert("RGBA")
+        if keep_alpha:
+            return rgba
         background = Image.new("RGB", rgba.size, (255, 255, 255))
         background.paste(rgba, mask=rgba.getchannel("A"))
         return background
+    if keep_alpha:
+        return img.convert("RGBA")
     return img.convert("RGB")
 
 
@@ -126,16 +128,18 @@ def make_pixel_art(
     sharpness: float = DEFAULT_SHARPNESS,
     palette_colors: tuple | None = None,
     cut_bg: bool = False,
-    bg_tolerance: int = DEFAULT_BG_TOLERANCE,
+    bg_tolerance: int = 0,
     crop_object: bool = False,
-    padding: int = DEFAULT_PADDING,
+    padding: int = 10,
     outline: bool = False,
+    show_grid: bool = False,
 ) -> Image.Image:
     """Пикселизация RGB-изображения: фон/кадр -> сетка -> квантизация -> квадраты.
 
     Возвращает RGBA (при вырезке фона) или RGB, большая сторона — целое кратное
     размера сетки и близка к RESULT_MAX_SIDE. pixel_size="custom" использует
-    custom_grid (свой уровень пикселизации, GRID_MIN..GRID_MAX).
+    custom_grid (свой уровень пикселизации, GRID_MIN..GRID_MAX). bg_tolerance=0 —
+    порог фона подбирается автоматически. show_grid — подсветка границ пикселей.
     """
     if pixel_size in GRID_BY_SIZE:
         grid_level = GRID_BY_SIZE[pixel_size]
@@ -199,12 +203,22 @@ def make_pixel_art(
     # 6) сборка и увеличение NEAREST'ом в целое число раз
     scale = max(1, round(RESULT_MAX_SIDE / max(grid_w, grid_h)))
     if solid.all():  # прозрачности нет — возвращаем обычный RGB
-        return Image.fromarray(rgb_out, "RGB").resize(
+        art = Image.fromarray(rgb_out, "RGB").resize(
             (grid_w * scale, grid_h * scale), Image.Resampling.NEAREST
         )
+        return _draw_pixel_grid(art, scale) if show_grid else art
     final = np.dstack([rgb_out, np.where(solid, 255, 0).astype(np.uint8)])
     art = Image.fromarray(final, "RGBA")
-    return art.resize((grid_w * scale, grid_h * scale), Image.Resampling.NEAREST)
+    art = art.resize((grid_w * scale, grid_h * scale), Image.Resampling.NEAREST)
+    return _draw_pixel_grid(art, scale) if show_grid else art
+
+
+def _draw_pixel_grid(img: Image.Image, scale: int) -> Image.Image:
+    """Подсветить границы пикселей сетки (тонные тёмные линии)."""
+    arr = np.asarray(img).copy()
+    arr[::scale, :, :3] = (arr[::scale, :, :3].astype(np.float32) * 0.7).astype(np.uint8)
+    arr[:, ::scale, :3] = (arr[:, ::scale, :3].astype(np.float32) * 0.7).astype(np.uint8)
+    return Image.fromarray(arr, img.mode)
 
 
 # ---------------------------------------------------------------- фон и кадр
@@ -246,6 +260,28 @@ def _bg_color(arr: np.ndarray) -> np.ndarray:
     return np.median(corners, axis=0)
 
 
+_AUTO_TOLERANCE_CANDIDATES = (24, 40, 64, 96, 128)
+
+
+def _auto_bg_tolerance(arr: np.ndarray) -> int:
+    """Подобрать порог фона автоматически (для bg_tolerance=0).
+
+    Перебирает кандидатов на уменьшенной копии и берёт первый, при котором
+    заливка от краёв убирает правдоподобную долю фона (5–92% кадра).
+    """
+    factor = max(1, max(arr.shape[:2]) // 96)
+    sub = arr[::factor, ::factor]
+    bg = _bg_color(sub)
+    dist = np.sqrt(((sub.astype(np.float64) - bg) ** 2).sum(axis=2))
+    for tol in _AUTO_TOLERANCE_CANDIDATES:
+        close = dist <= tol
+        flooded = _flood_from_border(close)
+        coverage = flooded.sum() / flooded.size
+        if 0.05 <= coverage <= 0.92:
+            return tol
+    return 64
+
+
 def _frame_image(
     img: Image.Image,
     cut_bg: bool,
@@ -255,7 +291,8 @@ def _frame_image(
 ) -> Image.Image:
     """Вырезать фон (flood fill от краёв) и/или кадрировать до объекта.
 
-    Возвращает RGBA; без вырезки альфа непрозрачная.
+    bg_tolerance=0 — порог подбирается автоматически. Возвращает RGBA;
+    без вырезки альфа непрозрачная.
     """
     arr = np.asarray(img.convert("RGB"))
     height, width = arr.shape[:2]
@@ -264,7 +301,8 @@ def _frame_image(
     dist = np.sqrt(((arr.astype(np.float64) - bg) ** 2).sum(axis=2))
 
     if cut_bg:
-        close = dist <= max(1, bg_tolerance)
+        tolerance = bg_tolerance if bg_tolerance and bg_tolerance > 0 else _auto_bg_tolerance(arr)
+        close = dist <= max(1, tolerance)
         # BFS на четверти разрешения — быстро даже на 4000 px
         flooded_q = _flood_from_border(close[::4, ::4])
         flooded = np.repeat(np.repeat(flooded_q, 4, axis=0), 4, axis=1)[:height, :width]
@@ -364,20 +402,35 @@ def shared_palette_from_grids(grids: list[np.ndarray], n_colors: int) -> tuple:
 
 def render_pack_tile(grid_arr: np.ndarray, palette: tuple, dither: bool) -> np.ndarray:
     """Квантизация тайла в палитру пака; дизеринг — FS по 3×3-размножению
-    (wrap-around), чтобы ошибка распространялась и через швы."""
+    (wrap-around), чтобы ошибка распространялась и через швы.
+
+    RGBA-вход (пак с прозрачностью): альфа бинаризуется, прозрачные пиксели
+    в палитре не участвуют визуально.
+    """
     n = grid_arr.shape[0]
+    has_alpha = grid_arr.shape[-1] == 4
+    rgb = grid_arr[..., :3]
+    alpha = grid_arr[..., 3] if has_alpha else np.full((n, n), 255, dtype=np.uint8)
     palette_img = Image.new("P", (1, 1))
-    palette_img.putpalette([v for rgb in palette for v in rgb])
+    palette_img.putpalette([v for rgb_c in palette for v in rgb_c])
     if dither:
-        tiled = np.tile(grid_arr, (3, 3, 1))
+        tiled = np.tile(rgb, (3, 3, 1))
         quantized = Image.fromarray(tiled, "RGB").quantize(
             palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG
         )
-        return np.asarray(quantized.convert("RGB"))[n : 2 * n, n : 2 * n]
-    quantized = Image.fromarray(grid_arr, "RGB").quantize(
-        palette=palette_img, dither=Image.Dither.NONE
-    )
-    return np.asarray(quantized.convert("RGB"))
+        rgb_out = np.asarray(quantized.convert("RGB"))[n : 2 * n, n : 2 * n]
+    else:
+        quantized = Image.fromarray(rgb, "RGB").quantize(
+            palette=palette_img, dither=Image.Dither.NONE
+        )
+        rgb_out = np.asarray(quantized.convert("RGB"))
+    if not has_alpha:
+        return rgb_out
+    solid = alpha >= 128
+    if solid.all():  # альфа непрозрачная — RGB меньше весит и совместим со всем
+        return rgb_out
+    out = np.dstack([rgb_out, np.where(solid, 255, 0).astype(np.uint8)])
+    return out
 
 
 def contact_sheet(tiles: list[np.ndarray], scale: int = 4) -> Image.Image:
@@ -520,9 +573,10 @@ def render(
         palette_colors=custom_palette,
         cut_bg=settings.cut_bg,
         bg_tolerance=settings.bg_tolerance,
-        crop_object=settings.crop_object,
-        padding=settings.padding,
+        crop_object=settings.crop_mode != "off",
+        padding=0 if settings.crop_mode == "fill" else 15,
         outline=settings.outline,
+        show_grid=settings.show_grid,
     )
     art = post_effects(
         art,

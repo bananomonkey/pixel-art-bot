@@ -35,20 +35,14 @@ from .admin import (
 )
 from .config import (
     ADJUSTMENT_STEP,
-    BG_TOLERANCE_RANGE,
-    BG_TOLERANCE_STEP,
     CONTRAST_RANGE,
-    DEFAULT_BG_TOLERANCE,
     DEFAULT_CONTRAST,
-    DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
     GRID_MAX,
     GRID_MIN,
     MAX_CONCURRENT_JOBS,
     MAX_FILE_SIZE,
-    PADDING_RANGE,
-    PADDING_STEP,
     PALETTE_MAX_COLORS,
     RATE_LIMIT_SECONDS,
     SATURATION_RANGE,
@@ -94,6 +88,7 @@ register_admin_handlers(router)
 store = StateStore(max_entries=STATE_MAX_ENTRIES, ttl_seconds=STATE_TTL_SECONDS)
 favorites = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> Settings
 custom_palettes = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> палитра
+my_grids = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> свой уровень сетки
 pack_settings = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> PackSettings
 _palette_flow: set[int] = set()  # пользователи, ожидающие ввода своей палитры
 _grid_flow: dict[int, tuple[int, int]] = {}  # user_id -> (chat_id, message_id) цели
@@ -123,11 +118,16 @@ _ADJUSTMENTS = {
     "shp": ("sharpness", SHARPNESS_RANGE, SHARPNESS_STEP, DEFAULT_SHARPNESS),
 }
 # корректируемые кнопками ± целочисленные параметры кадра
-_FRAME_STEPS = {
-    "bgtol": ("bg_tolerance", BG_TOLERANCE_RANGE, BG_TOLERANCE_STEP, DEFAULT_BG_TOLERANCE, ""),
-    "pad": ("padding", PADDING_RANGE, PADDING_STEP, DEFAULT_PADDING, "%"),
-}
-_VIEWS = ("main", "palettes", "adjust", "effects", "frame", "export")
+_GRID_STEP = 8  # шаг кнопок «Сетка −/+»
+_CROP_MODES = ("off", "fill", "pad")  # весь кадр | объект крупно | объект с полем
+_VIEWS = ("main", "palettes", "adjust", "effects", "frame", "export", "grid")
+
+
+def _effective_grid(settings: Settings) -> int:
+    """Текущий размер сетки: пресет или свой уровень."""
+    if settings.pixel_size == "custom":
+        return settings.custom_grid
+    return GRID_BY_SIZE[settings.pixel_size]
 
 
 # ---------------------------------------------------------------- команды
@@ -310,8 +310,22 @@ async def palette_capture(message: Message, bot: Bot) -> None:
             logger.warning("скачивание для палитры не удалось: %s", exc)
             await message.answer(TEXT_ERROR)
             return
+    elif message.document and (message.document.file_name or "").lower().endswith((".hex", ".txt")):
+        # палитра файлом (формат lospec .hex / обычный список hex)
+        try:
+            data = await _download(bot, message.document.file_id)
+        except TelegramBadRequest as exc:
+            logger.warning("скачивание файла палитры не удалось: %s", exc)
+            await message.answer(TEXT_ERROR)
+            return
+        colors = parse_hex_colors(data.decode("utf-8", errors="ignore"))
+        if len(colors) < 2:
+            await message.answer(
+                "В файле не нашлось цветов (нужно хотя бы два, по одному в строке) — или /cancel."
+            )
+            return
     else:
-        await message.answer("Пришли текст с hex-цветами или фото — или /cancel.")
+        await message.answer("Пришли текст с hex-цветами, файл .hex или фото — или /cancel.")
         return
 
     custom_palettes.put(uid, colors[:PALETTE_MAX_COLORS])
@@ -379,7 +393,7 @@ async def on_photo(message: Message, bot: Bot) -> None:
     chats.touch(message.chat.id)
     if uid in pack_sessions:  # режим ассет-пака: фото в буфер, без пикселизации
         data = await _download(bot, message.photo[-1].file_id)
-        count = add_photo(uid, data)
+        count = add_photo(uid, data, name=None)
         if count is None:
             await bot.send_message(
                 message.chat.id, f"🧱 Лимит пака — {MAX_PACK_PHOTOS} фото. /packdone — собрать."
@@ -418,7 +432,7 @@ async def on_document(message: Message, bot: Bot) -> None:
         return
     if uid in pack_sessions:  # режим ассет-пака: файл в буфер
         data = await _download(bot, document.file_id)
-        count = add_photo(uid, data)
+        count = add_photo(uid, data, name=document.file_name)
         if count is None:
             await bot.send_message(
                 message.chat.id, f"🧱 Лимит пака — {MAX_PACK_PHOTOS} фото. /packdone — собрать."
@@ -490,6 +504,9 @@ async def _process_new(
             settings = Settings()
     elif settings is None:
         settings = Settings()
+        saved_grid = my_grids.get(uid) if uid is not None else None
+        if saved_grid:  # «💾 Сделать моим»: новый уровень для новых фото
+            settings = replace(settings, pixel_size="custom", custom_grid=saved_grid)
     try:
         async with _jobs:
             if first_frame:
@@ -524,20 +541,59 @@ async def _process_new(
 
 
 @router.callback_query(F.data == "size:custom")
-async def cb_size_custom(callback: CallbackQuery) -> None:
-    """«📏 Свой»: запросить у пользователя число — свой уровень пикселизации."""
+async def cb_size_custom(callback: CallbackQuery, bot: Bot) -> None:
+    """«📏 Свой»: открыть подменю своего уровня (Сетка ±, «Мой», ввод числа)."""
     loaded = _load(callback)
     if loaded is None:
         await _stale(callback)
         return
-    uid = callback.from_user.id
-    _grid_flow[uid] = (loaded[0], loaded[1])
-    _palette_flow.discard(uid)
-    await callback.answer(
-        f"Пришли следующим сообщением число {GRID_MIN}–{GRID_MAX} — размер сетки в px "
-        "(меньше = крупнее пиксели)",
-        show_alert=True,
-    )
+    chat_id, message_id, entry = loaded
+    try:
+        await bot.edit_message_reply_markup(
+            chat_id=chat_id, message_id=message_id, reply_markup=_keyboard(entry.settings, "grid")
+        )
+    except TelegramBadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            logger.warning("edit_message_reply_markup не удался: %s", exc)
+            await callback.answer(TEXT_ERROR, show_alert=True)
+            return
+    store.put(chat_id, message_id, entry.source, entry.settings,
+              custom_palette=entry.custom_palette, view="grid")
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("grid:"))
+async def cb_grid(callback: CallbackQuery, bot: Bot) -> None:
+    """Подменю «📏 Свой»: Сетка −/+, сделать моим, ввод числа."""
+    loaded = _load(callback)
+    if loaded is None:
+        await _stale(callback)
+        return
+    chat_id, message_id, entry = loaded
+    action = (callback.data or "").split(":", 1)[1]
+    current = _effective_grid(entry.settings)
+    if action in ("m", "p"):
+        new_grid = max(GRID_MIN, min(GRID_MAX, current + (_GRID_STEP if action == "p" else -_GRID_STEP)))
+        settings = replace(entry.settings, pixel_size="custom", custom_grid=new_grid)
+        await _apply(callback, bot, chat_id, message_id, entry, settings, view="grid")
+        return
+    if action == "ask":
+        uid = callback.from_user.id
+        _grid_flow[uid] = (chat_id, message_id)
+        _palette_flow.discard(uid)
+        await callback.answer(
+            f"Пришли следующим сообщением число {GRID_MIN}–{GRID_MAX} — размер сетки в px "
+            "(меньше = крупнее пиксели)",
+            show_alert=True,
+        )
+        return
+    if action == "mine":
+        my_grids.put(callback.from_user.id, current)
+        await callback.answer(
+            f"💾 Мой уровень: {current} px — новые фото будут сразу в нём (/mystyle не нужен)"
+        )
+        return
+    await callback.answer()
 
 
 @router.callback_query(F.data.startswith("size:"))
@@ -793,14 +849,14 @@ async def cb_menu(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("eff:"))
 async def cb_effect(callback: CallbackQuery, bot: Bot) -> None:
-    """Переключатели эффектов: обводка, CRT, зерно."""
+    """Переключатели эффектов: обводка, CRT, зерно, сетка."""
     loaded = _load(callback)
     if loaded is None:
         await _stale(callback)
         return
     chat_id, message_id, entry = loaded
     kind = (callback.data or "").split(":", 1)[-1]
-    field = {"outline": "outline", "crt": "crt", "grain": "grain"}.get(kind)
+    field = {"outline": "outline", "crt": "crt", "grain": "grain", "grid": "show_grid"}.get(kind)
     if field is None:
         await callback.answer()
         return
@@ -810,31 +866,31 @@ async def cb_effect(callback: CallbackQuery, bot: Bot) -> None:
 
 @router.callback_query(F.data.startswith("frame:"))
 async def cb_frame(callback: CallbackQuery, bot: Bot) -> None:
-    """Кадр и фон: вырезка, объект, порог и отступ кнопками ±."""
+    """Кадр и фон по-человечески: «Фон: авто» и «Кадр: весь / крупно / с полем»."""
     loaded = _load(callback)
     if loaded is None:
         await _stale(callback)
         return
     chat_id, message_id, entry = loaded
     action = (callback.data or "").split(":", 1)[-1]
-    if action == "cutbg":
+    if action == "bg":
         settings = replace(entry.settings, cut_bg=not entry.settings.cut_bg)
-        await _apply(callback, bot, chat_id, message_id, entry, settings)
+        await _apply(
+            callback, bot, chat_id, message_id, entry, settings,
+            toast="✂️ Фон будет вырезан (порог подберётся сам)" if settings.cut_bg
+            else "Фон больше не вырезается",
+        )
         return
     if action == "crop":
-        settings = replace(entry.settings, crop_object=not entry.settings.crop_object)
-        await _apply(callback, bot, chat_id, message_id, entry, settings)
-        return
-    parts = action.split(":")
-    if len(parts) == 2 and parts[0] in _FRAME_STEPS:
-        field, (lo, hi), step, default, _suffix = _FRAME_STEPS[parts[0]]
-        current = getattr(entry.settings, field)
-        new_value = int(max(lo, min(hi, current + (step if parts[1] == "p" else -step))))
-        if new_value == current:
-            await callback.answer("Предел достигнут", show_alert=True)
-            return
-        settings = replace(entry.settings, **{field: new_value})
-        await _apply(callback, bot, chat_id, message_id, entry, settings)
+        index = _CROP_MODES.index(entry.settings.crop_mode) if entry.settings.crop_mode in _CROP_MODES else 0
+        settings = replace(entry.settings, crop_mode=_CROP_MODES[(index + 1) % len(_CROP_MODES)])
+        toasts = {
+            "off": "Кадр: вся картинка целиком",
+            "fill": "🎯 Кадр: объект крупно (фон за пределами объекта отрезан)",
+            "pad": "🖼 Кадр: объект с небольшим полем",
+        }
+        await _apply(callback, bot, chat_id, message_id, entry, settings,
+                     toast=toasts[settings.crop_mode])
         return
     await callback.answer()
 
@@ -1173,24 +1229,42 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
                 *back,
             ]
         )
+    if view == "grid":
+        current = _effective_grid(settings)
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=f"Сетка − ({current})", callback_data="grid:m"),
+                 InlineKeyboardButton(text=f"Сетка + ({current})", callback_data="grid:p")],
+                [InlineKeyboardButton(text="💾 Сделать моим", callback_data="grid:mine"),
+                 InlineKeyboardButton(text="⌨️ Ввести число…", callback_data="grid:ask")],
+                *back,
+            ]
+        )
     if view == "effects":
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=_mark("Обводка", settings.outline), callback_data="eff:outline"),
                  InlineKeyboardButton(text=_mark("CRT", settings.crt), callback_data="eff:crt"),
                  InlineKeyboardButton(text=_mark("Зерно", settings.grain), callback_data="eff:grain")],
+                [InlineKeyboardButton(text=_mark("#️⃣ Показать сетку", settings.show_grid), callback_data="eff:grid")],
                 *back,
             ]
         )
     if view == "frame":
+        crop_labels = {
+            "off": "Весь кадр",
+            "fill": "Объект крупно",
+            "pad": "Объект с полем",
+        }
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=_mark("✂️ Вырезать фон", settings.cut_bg), callback_data="frame:cutbg"),
-                 InlineKeyboardButton(text=_mark("🎯 Объект", settings.crop_object), callback_data="frame:crop")],
-                [InlineKeyboardButton(text=f"Порог {settings.bg_tolerance} −", callback_data="frame:bgtol:m"),
-                 InlineKeyboardButton(text=f"Порог {settings.bg_tolerance} +", callback_data="frame:bgtol:p")],
-                [InlineKeyboardButton(text=f"Отступ {settings.padding}% −", callback_data="frame:pad:m"),
-                 InlineKeyboardButton(text=f"Отступ {settings.padding}% +", callback_data="frame:pad:p")],
+                [InlineKeyboardButton(
+                    text=_mark("✂️ Фон: " + ("вырезать" if settings.cut_bg else "не вырезать"),
+                               settings.cut_bg),
+                    callback_data="frame:bg")],
+                [InlineKeyboardButton(
+                    text=f"🎯 Кадр: {crop_labels[settings.crop_mode] if settings.crop_mode in crop_labels else 'Весь кадр'}",
+                    callback_data="frame:crop")],
                 *back,
             ]
         )
@@ -1212,8 +1286,8 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
         or settings.saturation != DEFAULT_SATURATION
         or settings.sharpness != DEFAULT_SHARPNESS
     )
-    effects_done = settings.outline or settings.crt or settings.grain
-    frame_done = settings.cut_bg or settings.crop_object or settings.padding != DEFAULT_PADDING
+    effects_done = settings.outline or settings.crt or settings.grain or settings.show_grid
+    frame_done = settings.cut_bg or settings.crop_mode != "off"
     export_done = settings.sticker or settings.watermark
     size_row = [
         InlineKeyboardButton(
@@ -1263,15 +1337,21 @@ def _caption(settings: Settings) -> str:
         )
     )
     text = f"🎨 {_grid_label(settings)} · {palette_label} · дизеринг {'вкл' if settings.dither else 'выкл'}"
-    adjustments = []
+    extras = []
+    if settings.cut_bg:
+        extras.append("фон вырезан")
+    if settings.crop_mode == "fill":
+        extras.append("объект крупно")
+    elif settings.crop_mode == "pad":
+        extras.append("объект с полем")
     if settings.contrast != DEFAULT_CONTRAST:
-        adjustments.append(f"контраст {settings.contrast:g}")
+        extras.append(f"контраст {settings.contrast:g}")
     if settings.saturation != DEFAULT_SATURATION:
-        adjustments.append(f"насыщ {settings.saturation:g}")
+        extras.append(f"насыщ {settings.saturation:g}")
     if settings.sharpness != DEFAULT_SHARPNESS:
-        adjustments.append(f"резкость {settings.sharpness:g}")
-    if adjustments:
-        text += " · " + ", ".join(adjustments)
+        extras.append(f"резкость {settings.sharpness:g}")
+    if extras:
+        text += " · " + ", ".join(extras)
     return text
 
 

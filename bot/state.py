@@ -9,10 +9,8 @@ from collections import OrderedDict
 from dataclasses import dataclass, replace
 
 from .config import (
-    DEFAULT_BG_TOLERANCE,
     DEFAULT_CONTRAST,
     DEFAULT_CUSTOM_GRID,
-    DEFAULT_PADDING,
     DEFAULT_SATURATION,
     DEFAULT_SHARPNESS,
 )
@@ -42,15 +40,15 @@ class Settings:
     contrast: float = DEFAULT_CONTRAST
     saturation: float = DEFAULT_SATURATION
     sharpness: float = DEFAULT_SHARPNESS
-    # кадр и фон
+    # кадр и фон (порог подбирается автоматически: bg_tolerance=0)
     cut_bg: bool = False  # вырезать фон (flood fill от краёв)
-    bg_tolerance: int = DEFAULT_BG_TOLERANCE  # порог схожести с фоном
-    crop_object: bool = False  # «только объект»: кадрирование по контенту
-    padding: int = DEFAULT_PADDING  # отступ вокруг объекта, %
+    bg_tolerance: int = 0  # 0 — авто; вручную не выставляется из UI
+    crop_mode: str = "off"  # off (весь кадр) | fill (объект крупно) | pad (объект с полем)
     # эффекты
     outline: bool = False  # обводка объекта
     crt: bool = False  # сканлайны
     grain: bool = False  # зерно
+    show_grid: bool = False  # подсветка границ пикселей
     # экспорт
     sticker: bool = False  # «📎 PNG» отдаёт стикер 512 px
     watermark: bool = False  # подпись бота на результате

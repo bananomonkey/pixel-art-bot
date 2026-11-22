@@ -35,7 +35,7 @@ def _source_image(seed=3, size=320):
 
 
 def _sources(count=3):
-    return [_source_image(seed) for seed in range(3, 3 + count)]
+    return [(None, _source_image(seed)) for seed in range(3, 3 + count)]
 
 
 # ------------------------------------------------------------------ кроп и бесшовность
@@ -148,7 +148,7 @@ def test_build_asset_pack_final_tile_seamless():
 def test_build_asset_pack_custom_palette():
     from bot.pixelart import extract_palette
 
-    palette = extract_palette(Image.open(io.BytesIO(_sources(1)[0])), 8)
+    palette = extract_palette(Image.open(io.BytesIO(_sources(1)[0][1])), 8)
     zip_bytes, _ = build_asset_pack(_sources(2), PackSettings(palette="custom"), palette)
     tile = np.asarray(Image.open(io.BytesIO(zipfile.ZipFile(io.BytesIO(zip_bytes)).read("tile_01_64x64.png"))))
     pixels = set(map(tuple, tile.reshape(-1, 3).tolist()))

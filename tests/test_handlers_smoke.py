@@ -189,17 +189,46 @@ def test_effects(env):
         assert getattr(handlers.store.get(env.chat_id, env.message_id).settings, field) is True
 
 
-def test_frame_toggles_and_steps(env):
-    _run(handlers.cb_frame(_callback(env, "frame:cutbg"), env.bot))
+def test_frame_toggles_and_modes(env):
+    _run(handlers.cb_frame(_callback(env, "frame:bg"), env.bot))
     assert handlers.store.get(env.chat_id, env.message_id).settings.cut_bg is True
-    _run(handlers.cb_frame(_callback(env, "frame:crop"), env.bot))
-    assert handlers.store.get(env.chat_id, env.message_id).settings.crop_object is True
-    before = handlers.store.get(env.chat_id, env.message_id).settings.bg_tolerance
-    _run(handlers.cb_frame(_callback(env, "frame:bgtol:p"), env.bot))
-    after = handlers.store.get(env.chat_id, env.message_id).settings.bg_tolerance
-    assert after == before + handlers.BG_TOLERANCE_STEP
-    _run(handlers.cb_frame(_callback(env, "frame:pad:p"), env.bot))
-    assert handlers.store.get(env.chat_id, env.message_id).settings.padding > handlers.DEFAULT_PADDING
+    # порог теперь авто: остаётся 0 (подбирается сам)
+    assert handlers.store.get(env.chat_id, env.message_id).settings.bg_tolerance == 0
+    # кадр циклится: off -> fill -> pad -> off
+    for expected in ("fill", "pad", "off"):
+        _run(handlers.cb_frame(_callback(env, "frame:crop"), env.bot))
+        assert handlers.store.get(env.chat_id, env.message_id).settings.crop_mode == expected
+
+
+def test_grid_plus_minus(env):
+    """Сетка −/+ в подменю: сразу перерисовывает картинку в custom-уровень."""
+    _run(handlers.cb_size_custom(_callback(env, "size:custom", uid=2), env.bot))
+    env.bot.calls.clear()
+    _run(handlers.cb_grid(_callback(env, "grid:p", uid=2), env.bot))
+    entry = handlers.store.get(env.chat_id, env.message_id)
+    assert entry.settings.pixel_size == "custom" and entry.settings.custom_grid == 104
+    assert any(name == "edit_message_media" for name, _ in env.bot.calls)
+    _run(handlers.cb_grid(_callback(env, "grid:m", uid=2), env.bot))
+    assert handlers.store.get(env.chat_id, env.message_id).settings.custom_grid == 96
+
+
+def test_my_grid_applies_to_new_photos(env):
+    """«💾 Сделать моим»: новое фото сразу в сохранённом уровне."""
+    handlers.my_grids.put(3, 40)
+    handlers.pack_sessions.clear()
+    photo = PhotoSize(file_id="gg", file_unique_id="u", width=100, height=100)
+    message = Message(
+        message_id=9,
+        chat=Chat(id=env.chat_id, type="private"),
+        date=datetime.now(timezone.utc),
+        from_user=User(id=3, is_bot=False, first_name="t"),
+        photo=[photo],
+    )
+    _run(handlers.on_photo(message, env.bot))
+    assert any(c[0] == "send_photo" for c in env.bot.calls)
+    entry = handlers.store.get(env.chat_id, 99)  # FakeBot.send_photo вернул message_id=99
+    assert entry is not None
+    assert entry.settings.pixel_size == "custom" and entry.settings.custom_grid == 40
 
 
 def test_export_toggles(env):
@@ -263,8 +292,7 @@ def test_admin_capture_does_not_block_grid_flow(env):
     from aiogram.dispatcher.event.bases import SkipHandler
 
     admin_uid = 424242  # ADMIN_IDS из conftest
-    cq = _callback(env, "size:custom", uid=admin_uid)
-    _run(handlers.cb_size_custom(cq))
+    _open_grid_menu(env, uid=admin_uid)
     assert admin_uid in handlers._grid_flow
 
     answered = []
@@ -312,12 +340,33 @@ def test_admin_capture_does_not_block_palette_flow(env):
     handlers.custom_palettes.drop(admin_uid)
 
 
-def test_grid_flow_applies_number(env):
-    """📏 Свой: кнопка ставит флоу, число применяет свой уровень к той же картинке."""
-    cq = _callback(env, "size:custom")
-    _run(handlers.cb_size_custom(cq))
-    assert 1 in handlers._grid_flow
+def _open_grid_menu(env, uid=1):
+    """Открыть подменю «📏 Свой» и запустить ввод числа."""
+    toasts = []
 
+    def _cq(data):
+        cq = _callback(env, data, uid=uid)
+        async def answer(text=None, show_alert=False):
+            toasts.append(text)
+        cq.answer = answer
+        return cq
+
+    _run(handlers.cb_size_custom(_cq("size:custom"), env.bot))
+    assert handlers.store.get(env.chat_id, env.message_id).view == "grid"
+    env.bot.calls.clear()
+    _run(handlers.cb_grid(_cq("grid:ask"), env.bot))
+    assert uid in handlers._grid_flow
+    return toasts
+
+
+def test_grid_menu_opens_and_ask(env):
+    toasts = _open_grid_menu(env)
+    assert any("число" in (t or "") for t in toasts), toasts
+
+
+def test_grid_flow_applies_number(env):
+    """📏 Свой → ввод числа → свой уровень применён к той же картинке."""
+    _open_grid_menu(env, uid=1)
     answered = []
 
     class FakeMessage(SimpleNamespace):
@@ -335,7 +384,7 @@ def test_grid_flow_applies_number(env):
 
 
 def test_size_custom_flow_invalid_keeps_asking(env):
-    _run(handlers.cb_size_custom(_callback(env, "size:custom")))
+    _open_grid_menu(env, uid=1)
     answered = []
 
     class FakeMessage(SimpleNamespace):
