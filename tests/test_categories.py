@@ -105,11 +105,13 @@ def test_outline_changes_result():
     plain = np.asarray(make_pixel_art(_object_on_white(), palette="gameboy", cut_bg=True))
     edged = np.asarray(make_pixel_art(_object_on_white(), palette="gameboy", cut_bg=True, outline=True))
     assert plain.tobytes() != edged.tobytes()
-    # обводка не выводит цвета за пределы палитры (потемнение умножением)
+    # сел-шейдинг: множители 1.35 (верх) / 0.7 (бока) / 0.4 (низ), обрезка по 255
+    multipliers = (1.35, 0.7, 0.4)
+    allowed = set(FIXED_PALETTES["gameboy"]) | {
+        tuple(int(min(255, c * m)) for c in col) for col in FIXED_PALETTES["gameboy"] for m in multipliers
+    }
     pixels = set(map(tuple, edged[..., :3].reshape(-1, 3).tolist()))
-    # тёмные пиксели обводки — умножение на 0.45, допускаем только округлённые варианты палитры
-    allowed = set(FIXED_PALETTES["gameboy"])
-    assert pixels <= allowed | {tuple(int(c * 0.45) for c in col) for col in allowed}
+    assert pixels <= allowed
 
 
 def test_post_effects_change_result():

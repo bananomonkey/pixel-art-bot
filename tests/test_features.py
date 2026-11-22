@@ -277,3 +277,65 @@ def test_parse_target_days():
     assert parse_target_days("0") is None
     assert parse_target_days("abc") is None
     assert parse_target_days("999") is None  # больше TARGETED_MAX_DAYS
+
+
+# ------------------------------------------------------------------ геймдев-инструменты
+
+
+def test_kmeans_palette_bounded_and_deterministic():
+    from bot.pixelart import _kmeans_palette
+
+    grid = np.asarray(make_pixel_art(_gradient(), palette="auto", n_colors=4, pixel_size="large").convert("RGB"))
+    p1 = _kmeans_palette(grid.reshape(-1, 3), 4)
+    p2 = _kmeans_palette(grid.reshape(-1, 3), 4)
+    assert p1 == p2  # детерминированность
+    assert 1 <= len(p1) <= 4
+    assert all(len(rgb) == 3 for rgb in p1)
+
+
+def test_dither_modes_all_work():
+    from bot.pixelart import DITHER_MODES
+
+    for mode in DITHER_MODES:
+        result = make_pixel_art(_gradient(), dither=mode, palette="pico8", pixel_size="large")
+        assert max(result.size) >= 1000, mode
+
+
+def test_dither_atkinson_differs_from_fs():
+    plain = make_pixel_art(_gradient(), dither="fs", palette="pico8", pixel_size="large")
+    atk = make_pixel_art(_gradient(), dither="atkinson", palette="pico8", pixel_size="large")
+    assert np.asarray(plain).tobytes() != np.asarray(atk).tobytes()
+
+
+def test_clahe_changes_render():
+    from bot.pixelart import render
+    from bot.state import Settings as _S
+
+    bio = io.BytesIO()
+    _gradient().save(bio, "JPEG", quality=92)
+    data = bio.getvalue()
+    plain = render(data, _S(cut_bg=True, crop_mode="fill"), flatten=True)
+    enhanced = render(data, _S(cut_bg=True, crop_mode="fill", clahe=True), flatten=True)
+    assert plain != enhanced
+
+
+def test_normal_map_valid_range():
+    from bot.pixelart import normal_map
+
+    nm = normal_map(np.random.RandomState(1).randint(0, 255, (32, 32, 3)))
+    assert nm.shape == (32, 32, 3)
+    assert nm.min() >= 0 and nm.max() <= 255
+
+
+def test_extract_frames_gif_and_sprite_sheet():
+    from bot.pixelart import build_sprite_sheet, extract_frames
+
+    frames = [Image.new("RGB", (64, 64), (i * 30, 100, 150)) for i in range(4)]
+    bio = io.BytesIO()
+    frames[0].save(bio, "GIF", save_all=True, append_images=frames[1:], duration=80, loop=0)
+    fr = extract_frames(bio.getvalue(), 12)
+    assert len(fr) == 4
+    png, preview = build_sprite_sheet(fr, 32, None, "off")
+    sheet = Image.open(io.BytesIO(png))
+    assert sheet.size == (128, 32)  # 4 кадра × 32 px
+    assert max(Image.open(io.BytesIO(preview)).size) == 512

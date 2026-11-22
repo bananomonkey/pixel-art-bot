@@ -36,7 +36,8 @@ class Settings:
     custom_grid: int = DEFAULT_CUSTOM_GRID  # свой уровень пикселизации (8–256)
     palette: str = "auto"  # auto | gameboy | nes | pico8 | c64 | bw | bw1 | zx | sweetie | cga | custom
     n_colors: int = 16  # только для «Авто», одно из COLOR_STEPS
-    dither: bool = False
+    dither: str = "off"  # off | fs | atkinson | bayer
+    clahe: bool = False  # локальный контраст («🪄 Детали»)
     contrast: float = DEFAULT_CONTRAST
     saturation: float = DEFAULT_SATURATION
     sharpness: float = DEFAULT_SHARPNESS

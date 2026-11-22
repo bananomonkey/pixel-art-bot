@@ -15,9 +15,11 @@ from PIL import Image
 
 from .palettes import FIXED_PALETTES, PALETTE_LABELS
 from .pixelart import (
+    build_autotile_set,
     contact_sheet,
     decode_source,
     make_seamless,
+    normal_map,
     render_pack_tile,
     shared_palette_from_grids,
     square_crop,
@@ -38,7 +40,8 @@ class PackSettings:
     grid: int = 64  # 16 | 32 | 64 | 128
     seam: str = "blend"  # blend | mirror | off
     palette: str = "auto"  # auto (общая) | custom | ключ фиксированной палитры
-    dither: bool = False
+    dither: str = "off"  # off | fs | atkinson | bayer
+    autotile: bool = False  # режим авто-тайлов: ровно 2 фото -> 16 переходов
 
     def palette_label(self) -> str:
         if self.palette == "auto":
@@ -46,6 +49,11 @@ class PackSettings:
         if self.palette == "custom":
             return "Свои"
         return PALETTE_LABELS.get(self.palette, self.palette)
+
+    def dither_label(self) -> str:
+        from .pixelart import DITHER_LABELS
+
+        return DITHER_LABELS.get(self.dither, self.dither)
 
 
 def add_photo(user_id: int, data: bytes, name: str | None = None) -> int | None:
@@ -103,19 +111,45 @@ def build_asset_pack(
     else:
         palette = FIXED_PALETTES[settings.palette]
 
-    tiles = [render_pack_tile(grid, palette, settings.dither) for grid in grids]
+    autotile = settings.autotile and len(grids) == 2
+    if autotile:
+        raw_tiles = build_autotile_set(grids[0][..., :3], grids[1][..., :3])
+        stems = [f"blob_{bits:04b}" for bits in range(16)]
+        tiles = [render_pack_tile(t, palette, settings.dither) for t in raw_tiles]
+    else:
+        tiles = [render_pack_tile(grid, palette, settings.dither) for grid in grids]
 
     counts: dict[str, int] = {}
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for index, ((name, _data), tile) in enumerate(zip(sources, tiles), 1):
-            base = _safe_stem(name, index)
+        stems_out = []
+        for index, tile in enumerate(tiles, 1):
+            base = stems[index - 1] if autotile else _safe_stem(sources[index - 1][0], index)
             number = counts.get(base, 0) + 1
             counts[base] = number
             stem = base if number == 1 else f"{base}_{number}"
+            stems_out.append(stem)
+            rgb_tile = tile[..., :3]
             bio = io.BytesIO()
             Image.fromarray(tile).save(bio, "PNG", optimize=True)
             archive.writestr(f"{stem}_{settings.grid}x{settings.grid}.png", bio.getvalue())
+            # карта нормалей (для динамического 2D-освещения в движках)
+            nrm = io.BytesIO()
+            Image.fromarray(normal_map(rgb_tile), "RGB").save(nrm, "PNG", optimize=True)
+            archive.writestr(f"{stem}_normal.png", nrm.getvalue())
+            # сверхсжатая версия 4×4 — миникарты и дальние LOD
+            cmap = io.BytesIO()
+            Image.fromarray(rgb_tile, "RGB").resize((4, 4), Image.Resampling.BOX).save(
+                cmap, "PNG", optimize=True
+            )
+            archive.writestr(f"{stem}_4x4.png", cmap.getvalue())
+        # палитра пака для редакторов (GIMP/Aseprite/.hex)
+        gpl = "GIMP Palette\nName: pixel-art-pack\nColumns: 3\n#\n" + "\n".join(
+            f"{r:3d} {g:3d} {b:3d}\t#{r:02X}{g:02X}{b:02X}" for r, g, b in palette
+        )
+        hexfile = "\n".join(f"{r:02X}{g:02X}{b:02X}" for r, g, b in palette) + "\n"
+        archive.writestr("palette.gpl", gpl)
+        archive.writestr("palette.hex", hexfile)
 
     # превью: RGBA-тайлы кладём на белый фон
     rgb_tiles = []

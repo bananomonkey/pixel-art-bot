@@ -115,12 +115,12 @@ def test_fixed_palettes_membership():
 
 def test_dither_changes_result():
     img = _gradient()
-    plain = np.asarray(make_pixel_art(img, palette="gameboy", dither=False))
-    dithered = np.asarray(make_pixel_art(img, palette="gameboy", dither=True))
+    plain = np.asarray(make_pixel_art(img, palette="gameboy", dither="off"))
+    dithered = np.asarray(make_pixel_art(img, palette="gameboy", dither="fs"))
     assert plain.tobytes() != dithered.tobytes()
     # «Авто» с Floyd–Steinberg тоже работает
-    auto_dithered = make_pixel_art(img, palette="auto", dither=True)
-    assert auto_dithered.size == make_pixel_art(img, palette="auto", dither=False).size
+    auto_dithered = make_pixel_art(img, palette="auto", dither="fs")
+    assert auto_dithered.size == make_pixel_art(img, palette="auto", dither="off").size
 
 
 def test_nearest_palette_vectorized_redmean():

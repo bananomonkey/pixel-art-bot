@@ -142,7 +142,7 @@ def test_dither(env):
     cq = _callback(env, "dither")
     _run(handlers.cb_dither(cq, env.bot))
     _assert_edited(env, cq)
-    assert handlers.store.get(env.chat_id, env.message_id).settings.dither is True
+    assert handlers.store.get(env.chat_id, env.message_id).settings.dither == "fs"
 
 
 def test_more_less_colors(env):
@@ -167,7 +167,7 @@ def test_adjust_reset(env):
     cq = _callback(env, "adj_reset")
     _run(handlers.cb_adjust_reset(cq, env.bot))
     entry = handlers.store.get(env.chat_id, env.message_id)
-    assert entry.settings.dither is False
+    assert entry.settings.dither == "off"
     assert entry.settings.contrast == handlers.DEFAULT_CONTRAST
 
 
@@ -506,12 +506,16 @@ def test_pack_settings_panel(env):
     _run(handlers.cb_pack_set(cq))
     settings = handlers.pack_settings.get(31)
     assert settings is not None and settings.grid == 32
+    assert settings.dither == "off"
     cq.data = "pk:seam:mirror"
     _run(handlers.cb_pack_set(cq))
     assert handlers.pack_settings.get(31).seam == "mirror"
     cq.data = "pk:dither"
     _run(handlers.cb_pack_set(cq))
-    assert handlers.pack_settings.get(31).dither is True
+    assert handlers.pack_settings.get(31).dither == "fs"
+    cq.data = "pk:autotile"
+    _run(handlers.cb_pack_set(cq))
+    assert handlers.pack_settings.get(31).autotile is True
 
 
 def test_photo_flow_end_to_end(env):

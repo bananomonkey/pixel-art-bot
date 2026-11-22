@@ -83,4 +83,5 @@ WATERMARK_TEXT = os.getenv("WATERMARK_TEXT", "@pixelartphoto_bot")
 # --- свой уровень пикселизации ---
 GRID_MIN = 8  # минимальный размер сетки по большой стороне
 GRID_MAX = 256  # максимальный
+MAX_SHEET_FRAMES = 12  # кадров в спрайт-листе
 DEFAULT_CUSTOM_GRID = 96  # значение до ввода своего числа

@@ -9,6 +9,9 @@ import io
 import logging
 import random
 import time
+
+import numpy as np
+from PIL import Image
 from collections import OrderedDict
 from dataclasses import replace
 
@@ -35,6 +38,7 @@ from .admin import (
 )
 from .config import (
     ADJUSTMENT_STEP,
+    MAX_SHEET_FRAMES,
     CONTRAST_RANGE,
     DEFAULT_CONTRAST,
     DEFAULT_SATURATION,
@@ -64,13 +68,17 @@ from .pack import (
 )
 from .palettes import FIXED_PALETTES, PALETTE_LABELS, PALETTE_ORDER, parse_hex_colors
 from .pixelart import (
+    DITHER_LABELS,
+    DITHER_MODES,
     GRID_BY_SIZE,
     ImageTooLargeError,
     UnsupportedMediaError,
     build_demo_image,
+    build_sprite_sheet,
     decode_source,
     encode_source,
     extract_first_frame,
+    extract_frames,
     extract_palette,
     parse_grid,
     render,
@@ -92,6 +100,8 @@ my_grids = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> сво
 pack_settings = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> PackSettings
 _palette_flow: set[int] = set()  # пользователи, ожидающие ввода своей палитры
 _grid_flow: dict[int, tuple[int, int]] = {}  # user_id -> (chat_id, message_id) цели
+_sheet_sessions: set[int] = set()  # пользователи, собирающие спрайт-лист
+_sheet_file: dict[int, str] = {}  # user_id -> file_id присланой анимации
 _recent_entry: dict[int, tuple[int, int]] = {}  # chat_id -> последнее (chat_id, message_id)
 _jobs = asyncio.Semaphore(MAX_CONCURRENT_JOBS)  # не более 2 одновременных обработок
 _last_photo_at: dict[int, float] = {}
@@ -172,7 +182,7 @@ async def cmd_help(message: Message) -> None:
         "✨ Эффекты — обводка, CRT-сканлайны, зерно\n"
         "🖼 Кадр — ✂️ вырезать фон, 🎯 только объект, отступ\n"
         "📤 Экспорт — 🔖 запомнить стиль, 📎 PNG, 🧩 стикер 512, 💧 водяной знак\n\n"
-        "Ассет-паки текстур: /pack → фото → /packdone; настройки — /packset.\n\n"
+        "Ассет-паки текстур: /pack → фото → /packdone; настройки — /packset.\nСпрайт-лист из GIF/MP4: /sheet → анимация → /sheetdone.\n\n"
         "Команды: /palette, /mystyle, /demo, /grid N (свой уровень пикселизации)."
     )
 
@@ -244,6 +254,71 @@ async def cmd_grid(message: Message, bot: Bot, command: CommandObject | None = N
         message.chat.id,
         "Сначала пришли фото, затем /grid 48 — или кнопка «📏 Свой» под результатом.",
     )
+
+
+@router.message(Command("sheet"))
+async def cmd_sheet(message: Message) -> None:
+    """Спрайт-лист из GIF/MP4: все кадры в общей палитре, лента PNG."""
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    chats.touch(message.chat.id)
+    _sheet_sessions.add(uid)
+    settings = pack_settings.get(uid) or PackSettings()
+    await message.answer(
+        "🎬 Режим спрайт-листа: пришли GIF или MP4 — бот раскадрует до "
+        f"{MAX_SHEET_FRAMES} кадров, пикселизирует в общей палитре и склеит "
+        f"ленту {settings.grid}×{settings.grid} × N кадров.\n"
+        "/sheetdone — собрать (настройки: /packset), /sheetcancel — отмена."
+    )
+
+
+@router.message(Command("sheetdone"))
+async def cmd_sheetdone(message: Message, bot: Bot) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    if uid not in _sheet_sessions:
+        await message.answer("Сессии спрайт-листа нет. /sheet — начать.")
+        return
+    _sheet_sessions.discard(uid)
+    file_id = _sheet_file.get(uid)
+    if not file_id:
+        await message.answer("Анимация не прислана. /sheet — начать заново.")
+        return
+    settings = pack_settings.get(uid) or PackSettings()
+    custom = custom_palettes.get(uid) if settings.palette == "custom" else None
+    await bot.send_message(message.chat.id, "🎬 Раскладываю на кадры…")
+    data = await _download(bot, file_id)
+    async with _jobs:
+        frames = await asyncio.to_thread(extract_frames, data, MAX_SHEET_FRAMES)
+        png, preview = await asyncio.to_thread(
+            build_sprite_sheet, frames, settings.grid,
+            custom if settings.palette == "custom" else None,
+            settings.dither,
+        )
+    await bot.send_document(
+        chat_id=message.chat.id,
+        document=BufferedInputFile(png, filename=f"spritesheet_{settings.grid}px.png"),
+        caption=f"🎬 {len(frames)} кадров · {settings.grid}×{settings.grid} · "
+        f"одна палитра на все кадры",
+    )
+    await bot.send_photo(
+        chat_id=message.chat.id,
+        photo=BufferedInputFile(preview, filename="sheet_preview.png"),
+        caption="🖼 Превью (×4)",
+    )
+
+
+@router.message(Command("sheetcancel"))
+async def cmd_sheetcancel(message: Message) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    dropped = uid in _sheet_sessions
+    _sheet_sessions.discard(uid)
+    _sheet_file.pop(uid, None)
+    await message.answer("Сессия спрайт-листа отменена." if dropped else "Активной сессии нет.")
 
 
 @router.message(Command("demo"))
@@ -473,6 +548,10 @@ async def on_animation(message: Message, bot: Bot) -> None:
     if uid is None:
         return
     chats.touch(message.chat.id)
+    if uid in _sheet_sessions:
+        _sheet_file[uid] = message.animation.file_id
+        await message.answer("🎬 Анимация принята. /sheetdone — собрать спрайт-лист.")
+        return
     if uid in pack_sessions:
         await message.answer("🧱 Для пака нужны фото (не анимации).")
         return
@@ -647,8 +726,12 @@ async def cb_dither(callback: CallbackQuery, bot: Bot) -> None:
         await _stale(callback)
         return
     chat_id, message_id, entry = loaded
-    flipped = replace(entry.settings, dither=not entry.settings.dither)
-    await _apply(callback, bot, chat_id, message_id, entry, flipped)
+    index = DITHER_MODES.index(entry.settings.dither) if entry.settings.dither in DITHER_MODES else 0
+    settings = replace(entry.settings, dither=DITHER_MODES[(index + 1) % len(DITHER_MODES)])
+    await _apply(
+        callback, bot, chat_id, message_id, entry, settings,
+        toast=f"Дизеринг: {DITHER_LABELS[settings.dither]}",
+    )
 
 
 @router.callback_query(F.data.startswith("adj:"))
@@ -658,6 +741,11 @@ async def cb_adjust(callback: CallbackQuery, bot: Bot) -> None:
         await _stale(callback)
         return
     chat_id, message_id, entry = loaded
+    if (callback.data or "") == "adj:clahe":
+        settings = replace(entry.settings, clahe=not entry.settings.clahe)
+        await _apply(callback, bot, chat_id, message_id, entry, settings,
+                     toast="🪄 Локальный контраст: вкл" if settings.clahe else "🪄 Локальный контраст: выкл")
+        return
     try:
         _, kind, sign = (callback.data or "").split(":")
         field, (lo, hi), step, _default = _ADJUSTMENTS[kind]
@@ -681,7 +769,7 @@ async def cb_adjust_reset(callback: CallbackQuery, bot: Bot) -> None:
     chat_id, message_id, entry = loaded
     settings = replace(
         entry.settings,
-        dither=False,
+        dither="off",
         contrast=DEFAULT_CONTRAST,
         saturation=DEFAULT_SATURATION,
         sharpness=DEFAULT_SHARPNESS,
@@ -892,6 +980,28 @@ async def cb_frame(callback: CallbackQuery, bot: Bot) -> None:
         await _apply(callback, bot, chat_id, message_id, entry, settings,
                      toast=toasts[settings.crop_mode])
         return
+    if action == "tiled":
+        # проверка бесшовности: текущий результат, склеенный 3×3
+        async with _jobs:
+            png = await asyncio.to_thread(
+                render, entry.source, entry.settings, entry.custom_palette, flatten=True
+            )
+            img = Image.open(io.BytesIO(png)).convert("RGB")
+            gw = _effective_grid(entry.settings)
+            small = img.resize((gw, gw), Image.Resampling.BOX)
+            big = np.kron(np.asarray(small), np.ones((3, 3, 1), dtype=np.uint8))
+            scale = max(1, round(1024 / big.shape[0]))
+            tiled = np.kron(big, np.ones((scale, scale, 1), dtype=np.uint8))
+        tiled_img = Image.fromarray(tiled.astype(np.uint8), "RGB")
+        bio = io.BytesIO()
+        tiled_img.save(bio, "PNG", optimize=True)
+        await bot.send_photo(
+            chat_id,
+            BufferedInputFile(bio.getvalue(), filename="tile_3x3.png"),
+            caption="🔀 Проверка стыков: если швов не видно — тайл бесшовный",
+        )
+        await callback.answer()
+        return
     await callback.answer()
 
 
@@ -989,9 +1099,10 @@ async def cmd_packdone(message: Message, bot: Bot) -> None:
         chat_id=message.chat.id,
         document=BufferedInputFile(zip_bytes, filename=f"asset_pack_{settings.grid}x{settings.grid}.zip"),
         caption=(
-            f"📦 {len(sources)} тайлов · {settings.grid}×{settings.grid} · "
-            f"бесшовность: {SEAM_MODES[settings.seam]} · {settings.palette_label()} · "
-            f"дизеринг {'вкл' if settings.dither else 'выкл'}"
+            f"📦 {'16 авто-тайлов' if settings.autotile and len(sources) == 2 else f'{len(sources)} тайлов'} · "
+            f"{settings.grid}×{settings.grid} · бесшовность: {SEAM_MODES[settings.seam]} · "
+            f"{settings.palette_label()} · дизеринг: {settings.dither_label()} · "
+            f"нормал-мапы, 4×4, .gpl/.hex в архиве"
         ),
     )
     await bot.send_photo(
@@ -1064,8 +1175,11 @@ def _pack_keyboard(settings: PackSettings) -> InlineKeyboardMarkup:
     palette_rows = [palette_buttons[i : i + 3] for i in range(0, len(palette_buttons), 3)]
     dither_row = [
         InlineKeyboardButton(
-            text=f"Дизеринг: {'вкл' if settings.dither else 'выкл'}", callback_data="pk:dither"
-        )
+            text=f"Дизеринг: {settings.dither_label()}", callback_data="pk:dither"
+        ),
+        InlineKeyboardButton(
+            text=_mark("🧩 Авто-тайлы (2 фото)", settings.autotile), callback_data="pk:autotile"
+        ),
     ]
     return InlineKeyboardMarkup(
         inline_keyboard=[grid_row, seam_row, dither_row, *palette_rows]
@@ -1088,7 +1202,10 @@ async def cb_pack_set(callback: CallbackQuery) -> None:
     elif len(parts) == 3 and parts[1] == "pal" and (parts[2] in ("auto", "custom") or parts[2] in FIXED_PALETTES):
         settings.palette = parts[2]
     elif len(parts) == 2 and parts[1] == "dither":
-        settings.dither = not settings.dither
+        modes = list(DITHER_MODES)
+        settings.dither = modes[(modes.index(settings.dither) + 1) % len(modes)] if settings.dither in modes else modes[1]
+    elif len(parts) == 2 and parts[1] == "autotile":
+        settings.autotile = not settings.autotile
     else:
         await callback.answer()
         return
@@ -1225,6 +1342,9 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
                  InlineKeyboardButton(text="Насыщ +", callback_data="adj:sat:p")],
                 [InlineKeyboardButton(text="Резк −", callback_data="adj:shp:m"),
                  InlineKeyboardButton(text="Резк +", callback_data="adj:shp:p")],
+                [InlineKeyboardButton(
+                    text=f"🪄 Детали: {'вкл' if settings.clahe else 'выкл'}",
+                    callback_data="adj:clahe")],
                 [InlineKeyboardButton(text="↺ Сброс корр.", callback_data="adj_reset")],
                 *back,
             ]
@@ -1265,6 +1385,7 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
                 [InlineKeyboardButton(
                     text=f"🎯 Кадр: {crop_labels[settings.crop_mode] if settings.crop_mode in crop_labels else 'Весь кадр'}",
                     callback_data="frame:crop")],
+                [InlineKeyboardButton(text="🔀 Проверка 3×3 (стыки)", callback_data="frame:tiled")],
                 *back,
             ]
         )
@@ -1336,7 +1457,8 @@ def _caption(settings: Settings) -> str:
             "Свои" if settings.palette == "custom" else PALETTE_LABELS[settings.palette]
         )
     )
-    text = f"🎨 {_grid_label(settings)} · {palette_label} · дизеринг {'вкл' if settings.dither else 'выкл'}"
+    dither_short = DITHER_LABELS.get(settings.dither, settings.dither)
+    text = f"🎨 {_grid_label(settings)} · {palette_label} · дизеринг: {dither_short}"
     extras = []
     if settings.cut_bg:
         extras.append("фон вырезан")

@@ -85,10 +85,10 @@ def test_settings_defaults_and_changes():
     assert settings.pixel_size == "medium"
     assert settings.palette == "auto"
     assert settings.n_colors == 16
-    assert settings.dither is False
-    changed = with_changes(settings, palette="gameboy", dither=True)
-    assert changed.palette == "gameboy" and changed.dither is True
-    assert settings.palette == "auto" and settings.dither is False  # оригинал не тронут
+    assert settings.dither == "off"
+    changed = with_changes(settings, palette="gameboy", dither="fs")
+    assert changed.palette == "gameboy" and changed.dither == "fs"
+    assert settings.palette == "auto" and settings.dither == "off"  # оригинал не тронут
 
 
 def test_color_steps_row():

@@ -100,8 +100,8 @@ def test_render_pack_tile_membership():
 def test_render_pack_tile_dither_changes_result():
     palette = shared_palette_from_grids([_gradient_grid(1)], 8)
     grid = _gradient_grid(4)
-    plain = render_pack_tile(grid, palette, dither=False)
-    dithered = render_pack_tile(grid, palette, dither=True)
+    plain = render_pack_tile(grid, palette, dither="off")
+    dithered = render_pack_tile(grid, palette, dither="fs")
     assert plain.tobytes() != dithered.tobytes()
 
 
@@ -118,9 +118,9 @@ def test_contact_sheet_size():
     "settings",
     [
         PackSettings(),
-        PackSettings(grid=32, seam="mirror", palette="pico8", dither=True),
+        PackSettings(grid=32, seam="mirror", palette="pico8", dither="fs"),
         PackSettings(seam="off"),
-        PackSettings(grid=16, seam="blend", dither=True),
+        PackSettings(grid=16, seam="blend", dither="fs"),
         PackSettings(grid=128, seam="blend", palette="auto"),
     ],
 )
@@ -129,8 +129,10 @@ def test_build_asset_pack(settings):
     zip_bytes, preview = build_asset_pack(sources, settings)
     archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
     names = archive.namelist()
-    assert len(names) == 3
-    assert all(name.endswith(f"_{settings.grid}x{settings.grid}.png") for name in names)
+    assert sum(name.endswith(f"_{settings.grid}x{settings.grid}.png") for name in names) == 3
+    assert "palette.gpl" in names and "palette.hex" in names
+    assert sum(name.endswith("_normal.png") for name in names) == 3
+    assert sum(name.endswith("_4x4.png") for name in names) == 3
     tile = Image.open(io.BytesIO(archive.read(names[0])))
     assert tile.size == (settings.grid, settings.grid) and tile.format == "PNG"
     preview_img = Image.open(io.BytesIO(preview))
@@ -180,3 +182,27 @@ def test_pack_settings_labels():
     assert ps.palette_label().startswith("Авто")
     assert PackSettings(palette="custom").palette_label() == "Свои"
     assert PackSettings(palette="gameboy").palette_label() == "Game Boy"
+
+
+def test_build_asset_pack_extras():
+    """В архиве: тайлы + нормал-мапы + color map 4×4 + палитра .gpl/.hex."""
+    zip_bytes, _ = build_asset_pack(_sources(2), PackSettings(grid=32, seam="blend", palette="pico8"))
+    archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    names = archive.namelist()
+    assert sum(name.endswith("_32x32.png") for name in names) == 2
+    assert sum(name.endswith("_normal.png") for name in names) == 2
+    assert sum(name.endswith("_4x4.png") for name in names) == 2
+    assert "palette.gpl" in names and "palette.hex" in names
+    assert archive.read("palette.gpl").decode().startswith("GIMP Palette")
+
+
+def test_build_asset_pack_autotile():
+    """Ровно 2 фото + авто-тайлы -> 16 blob-переходов с нормалями."""
+    sources = _sources(2)
+    zip_bytes, _ = build_asset_pack(sources, PackSettings(grid=32, autotile=True, palette="pico8"))
+    archive = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    tiles = [n for n in archive.namelist() if n.startswith("blob_") and n.endswith("_32x32.png")]
+    assert len(tiles) == 16
+    first = np.asarray(Image.open(io.BytesIO(archive.read(tiles[0]))).convert("RGB"))
+    last = np.asarray(Image.open(io.BytesIO(archive.read(tiles[-1]))).convert("RGB"))
+    assert first.tobytes() != last.tobytes()

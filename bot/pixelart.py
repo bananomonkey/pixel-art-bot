@@ -25,7 +25,7 @@ from .config import (
     UNIFORM_TRIM_TOLERANCE,
     WATERMARK_TEXT,
 )
-from .palettes import FIXED_PALETTES, as_numpy
+from .palettes import FIXED_PALETTES
 from .state import Settings
 
 # размер сетки (px по большей стороне) для каждого уровня кнопки «размер пикселя»
@@ -45,11 +45,92 @@ def parse_grid(text: str) -> int | None:
 # амплитуда упорядоченного дизеринга Bayer (сдвиг яркости, -32..+31)
 DITHER_STRENGTH = 64.0
 
-# матрица упорядоченного дизеринга Bayer 4x4
-_BAYER_4X4 = np.array(
-    [[0, 8, 2, 10], [12, 4, 14, 6], [3, 11, 1, 9], [15, 7, 13, 5]],
-    dtype=np.float64,
-)
+# режимы дизеринга и подписи кнопок
+DITHER_MODES: tuple[str, ...] = ("off", "fs", "atkinson", "bayer")
+DITHER_LABELS: dict[str, str] = {
+    "off": "Выкл",
+    "fs": "Флойд–Стейнберг",
+    "atkinson": "Аткинсон",
+    "bayer": "Байер 8×8",
+}
+
+
+def _bayer_matrix(size: int) -> np.ndarray:
+    """Матрица Байера (2→4→8) с порогами 0..1."""
+    matrix = np.array([[0.0, 2.0], [3.0, 1.0]])
+    while matrix.shape[0] < size:
+        matrix = np.block([[4 * matrix, 4 * matrix + 2], [4 * matrix + 3, 4 * matrix + 1]])
+    return (matrix + 0.5) / (size * size)
+
+
+_BAYER_8 = _bayer_matrix(8)
+
+
+def _nearest_index(buf: np.ndarray, palette: np.ndarray) -> np.ndarray:
+    """Индексы ближайших цветов палитры для буфера (h, w, 3) float."""
+    diff = buf[..., None, :] - palette[None, None, :, :]
+    return np.argmin((diff ** 2).sum(-1), axis=-1)
+
+
+def _apply_dither(pixels: np.ndarray, palette: np.ndarray, mode: str) -> np.ndarray:
+    """Квантизация в палитру с выбранным дизерингом. pixels — (h, w, 3) uint8.
+
+    off — без дизеринга; bayer — упорядоченный (Байер 8×8, периодический,
+    бесшовный для сеток кратных 8); fs / atkinson — последовательное
+    распространение ошибки.
+    """
+    palette = np.asarray(palette, dtype=np.float64)
+    if mode == "fs" or mode == "atkinson":
+        return _error_diffusion(pixels, palette, atkinson=(mode == "atkinson"))
+    if mode == "bayer":
+        height, width = pixels.shape[:2]
+        tile = np.tile(_BAYER_8, (height // 8 + 1, width // 8 + 1))[:height, :width]
+        shifted = np.clip(pixels.astype(np.float64) + (tile - 0.5)[..., None] * DITHER_STRENGTH, 0, 255)
+        return palette[_nearest_index(shifted, palette)].astype(np.uint8)
+    shifted = np.clip(pixels.astype(np.float64), 0, 255)
+    return palette[_nearest_index(shifted, palette)].astype(np.uint8)
+
+
+def _error_diffusion(pixels: np.ndarray, palette: np.ndarray, atkinson: bool) -> np.ndarray:
+    """Последовательное распространение ошибки: Floyd–Steinberg или Atkinson."""
+    height, width = pixels.shape[:2]
+    buf = pixels.astype(np.float64).copy()
+    out = np.zeros_like(buf)
+    if atkinson:
+        spread = [(1, 0, 1 / 8), (2, 0, 1 / 8), (-1, 1, 1 / 8), (0, 1, 1 / 8), (1, 1, 1 / 8), (0, 2, 1 / 8)]
+    else:
+        spread = [(1, 0, 7 / 16), (-1, 1, 3 / 16), (0, 1, 5 / 16), (1, 1, 1 / 16)]
+    for y in range(height):
+        row = buf[y]
+        for x in range(width):
+            old = row[x]
+            idx = int(np.argmin(((palette - old) ** 2).sum(-1)))
+            new = palette[idx]
+            out[y, x] = new
+            err = old - new
+            for dx, dy, weight in spread:
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < width and 0 <= ny < height:
+                    buf[ny, nx] += err * weight
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _kmeans_palette(pixels: np.ndarray, k: int, iters: int = 12) -> tuple:
+    """Палитра k-means (детерминированная) — сохраняет редкие акценты лучше mediancut."""
+    flat = pixels.reshape(-1, 3).astype(np.float64)
+    rng = np.random.default_rng(0)
+    if len(flat) > 8000:
+        flat = flat[rng.choice(len(flat), 8000, replace=False)]
+    k = max(2, min(k, len(np.unique(flat, axis=0)) or k))
+    centers = flat[rng.choice(len(flat), k, replace=False)].astype(np.float64)
+    for _ in range(iters):
+        assign = np.argmin(((flat[:, None, :] - centers[None, :, :]) ** 2).sum(-1), axis=-1)
+        for j in range(k):
+            members = flat[assign == j]
+            if len(members):
+                centers[j] = members.mean(axis=0)
+    unique = {tuple(int(v) for v in c) for c in np.clip(centers, 0, 255).round()}
+    return tuple(sorted(unique))
 
 
 class PixelArtError(Exception):
@@ -122,12 +203,13 @@ def make_pixel_art(
     custom_grid: int | None = None,
     palette: str = "auto",
     n_colors: int = 16,
-    dither: bool = False,
+    dither: str = "off",
     contrast: float = DEFAULT_CONTRAST,
     saturation: float = DEFAULT_SATURATION,
     sharpness: float = DEFAULT_SHARPNESS,
     palette_colors: tuple | None = None,
     cut_bg: bool = False,
+    enhance_details: bool = False,
     bg_tolerance: int = 0,
     crop_object: bool = False,
     padding: int = 10,
@@ -153,8 +235,9 @@ def make_pixel_art(
         raise ValueError(f"неизвестная палитра: {palette}")
     n_colors = max(2, min(64, int(n_colors)))
 
-    # 0) коррекции контраста/насыщенности/резкости
-    adjusted = ImageEnhance.Contrast(img).enhance(contrast)
+    # 0) локальный контраст (CLAHE) и коррекции
+    source = _clahe(img) if enhance_details else img
+    adjusted = ImageEnhance.Contrast(source).enhance(contrast)
     adjusted = ImageEnhance.Color(adjusted).enhance(saturation)
     adjusted = ImageEnhance.Sharpness(adjusted).enhance(sharpness)
 
@@ -184,17 +267,14 @@ def make_pixel_art(
 
     # 4) квантизация (прозрачные пиксели невидимы — цвет в них не важен)
     rgb_u8 = rgb_grid.astype(np.uint8)
-    grid_img = Image.fromarray(rgb_u8, "RGB")
     if palette == "auto":
-        dither_mode = Image.Dither.FLOYDSTEINBERG if dither else Image.Dither.NONE
-        grid_img = grid_img.quantize(
-            colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=dither_mode
-        ).convert("RGB")
-    elif palette == "custom":
-        grid_img = _map_to_fixed_palette(grid_img, palette_colors, dither=dither)
-    else:
-        grid_img = _map_to_fixed_palette(grid_img, FIXED_PALETTES[palette], dither=dither)
-    rgb_out = np.asarray(grid_img)
+        palette_colors = _kmeans_palette(rgb_u8, n_colors)
+    elif palette == "custom" and not palette_colors:
+        raise ValueError("для своей палитры не заданы цвета")
+    elif palette != "custom":
+        palette_colors = FIXED_PALETTES[palette]
+    dither = dither if dither in DITHER_MODES else "off"
+    rgb_out = _apply_dither(rgb_u8, np.asarray(palette_colors, dtype=np.uint8), dither)
 
     # 5) обводка по границам объекта (на сетке, до увеличения)
     if outline:
@@ -332,21 +412,40 @@ def _frame_image(
 
 
 def _apply_outline(rgb: np.ndarray, solid: np.ndarray, threshold: int = 40) -> np.ndarray:
-    """Затемнить граничные пиксели объекта (пиксельная обводка на сетке)."""
-    out = rgb.copy()
+    """Обводка с освещением (сел-шейдинг): верхние края объекта светлее,
+    нижние темнее, боковые — среднее. Границы с прозрачностью — тоже края."""
+    out = rgb.copy().astype(np.float64)
     h, w = solid.shape
-    edge = np.zeros_like(solid, dtype=bool)
     ints = rgb.astype(np.int16)
-    for dy, dx, a_sl, b_sl in ((0, 1, (slice(None), slice(None, -1)), (slice(None), slice(1, None))),
-                               (0, -1, (slice(None), slice(1, None)), (slice(None), slice(None, -1))),
-                               (1, 0, (slice(None, -1), slice(None)), (slice(1, None), slice(None))),
-                               (-1, 0, (slice(1, None), slice(None)), (slice(None, -1), slice(None)))):
-        diff = np.abs(ints[a_sl] - ints[b_sl]).max(axis=2) > threshold
-        boundary = solid[a_sl] != solid[b_sl]
-        mark = a_sl
-        edge[mark] |= (diff | boundary) & solid[mark]
-    out[edge] = (out[edge].astype(np.float32) * 0.45).astype(np.uint8)
-    return out
+    non_solid = ~solid
+
+    def _dir_diff(a_sl, b_sl):
+        """Граница пикселя в направлении соседа: другой цвет или прозрачность."""
+        color_diff = np.abs(ints[a_sl] - ints[b_sl]).max(axis=2) > threshold
+        full = np.zeros_like(solid)
+        full[a_sl] = (color_diff | non_solid[b_sl]) & solid[a_sl]
+        return full
+
+    # направления срезов: для пикселя (y, x) сосед (y+dy, x+dx)
+    up = _dir_diff((slice(1, None), slice(None)), (slice(None, -1), slice(None)))
+    up[-1, :] |= solid[-1, :]  # у края кадра считаем границу
+    down = _dir_diff((slice(None, -1), slice(None)), (slice(1, None), slice(None)))
+    down[0, :] |= solid[0, :]
+    left = _dir_diff((slice(None), slice(1, None)), (slice(None), slice(None, -1)))
+    left[:, 0] |= solid[:, 0]
+    right = _dir_diff((slice(None), slice(None, -1)), (slice(None), slice(1, None)))
+    right[:, -1] |= solid[:, -1]
+
+    side_edge = solid & (left | right) & ~up & ~down
+    top_edge = solid & up & ~down
+    bottom_edge = solid & down
+
+    mult = np.ones(solid.shape, dtype=np.float64)
+    mult[side_edge] = 0.7
+    mult[top_edge] = 1.35
+    mult[bottom_edge] = 0.4  # низ приоритетнее: один множитель на пиксель
+    out = np.clip(out * mult[..., None], 0, 255)
+    return out.astype(np.uint8)
 
 
 # ---------------------------------------------------------------- ассет-паки (текстуры)
@@ -400,30 +499,22 @@ def shared_palette_from_grids(grids: list[np.ndarray], n_colors: int) -> tuple:
     return tuple(dict.fromkeys(colors))
 
 
-def render_pack_tile(grid_arr: np.ndarray, palette: tuple, dither: bool) -> np.ndarray:
-    """Квантизация тайла в палитру пака; дизеринг — FS по 3×3-размножению
-    (wrap-around), чтобы ошибка распространялась и через швы.
+def render_pack_tile(grid_arr: np.ndarray, palette: tuple, dither: str) -> np.ndarray:
+    """Квантизация тайла в палитру пака; последовательный дизеринг (FS/Аткинсон)
+    — по 3×3-размножению (wrap-around), чтобы ошибка шла и через швы; Байер —
+    периодическая матрица, сама бесшовная.
 
-    RGBA-вход (пак с прозрачностью): альфа бинаризуется, прозрачные пиксели
-    в палитре не участвуют визуально.
+    RGBA-вход (пак с прозрачностью): альфа бинаризуется.
     """
     n = grid_arr.shape[0]
     has_alpha = grid_arr.shape[-1] == 4
     rgb = grid_arr[..., :3]
-    alpha = grid_arr[..., 3] if has_alpha else np.full((n, n), 255, dtype=np.uint8)
-    palette_img = Image.new("P", (1, 1))
-    palette_img.putpalette([v for rgb_c in palette for v in rgb_c])
-    if dither:
-        tiled = np.tile(rgb, (3, 3, 1))
-        quantized = Image.fromarray(tiled, "RGB").quantize(
-            palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG
-        )
-        rgb_out = np.asarray(quantized.convert("RGB"))[n : 2 * n, n : 2 * n]
+    alpha = grid_arr[..., 3] if has_alpha else None
+    pal = np.asarray(palette, dtype=np.uint8)
+    if dither in ("fs", "atkinson"):
+        rgb_out = _apply_dither(np.tile(rgb, (3, 3, 1)), pal, dither)[n : 2 * n, n : 2 * n]
     else:
-        quantized = Image.fromarray(rgb, "RGB").quantize(
-            palette=palette_img, dither=Image.Dither.NONE
-        )
-        rgb_out = np.asarray(quantized.convert("RGB"))
+        rgb_out = _apply_dither(rgb, pal, dither)
     if not has_alpha:
         return rgb_out
     solid = alpha >= 128
@@ -446,6 +537,145 @@ def contact_sheet(tiles: list[np.ndarray], scale: int = 4) -> Image.Image:
         sheet[row * size * scale : (row + 1) * size * scale,
               col * size * scale : (col + 1) * size * scale] = up
     return Image.fromarray(sheet, "RGB")
+
+
+# ---------------------------------------------------------------- геймдев-инструменты
+
+
+def _clahe(img: Image.Image, clip: float = 3.0, tiles: int = 8) -> Image.Image:
+    """Локальный контраст (упрощённый CLAHE по яркости, билинейные LUT) —
+    спасает мелкие детали при сильном уменьшении."""
+    arr = np.asarray(img.convert("RGB")).astype(np.float64)
+    h, w, _ = arr.shape
+    lum = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]) / 255.0
+    bins = np.clip((lum * 255).astype(np.int64), 0, 255)
+    ys = np.linspace(0, h, tiles + 1).astype(int)
+    xs = np.linspace(0, w, tiles + 1).astype(int)
+    luts = np.zeros((tiles, tiles, 256))
+    for i in range(tiles):
+        for j in range(tiles):
+            block = bins[ys[i]:ys[i + 1], xs[j]:xs[j + 1]].ravel()
+            hist = np.bincount(block, minlength=256).astype(np.float64)
+            limit = max(1.0, clip * block.size / 256)
+            excess = hist[hist > limit].sum() - np.minimum(hist, limit).sum()
+            hist = np.minimum(hist, limit) + excess / 256
+            cdf = hist.cumsum()
+            luts[i, j] = cdf / cdf[-1] if cdf[-1] > 0 else np.arange(256) / 255
+    gy = np.clip(np.arange(h) / max(1, h) * tiles - 0.5, 0, tiles - 1)
+    gx = np.clip(np.arange(w) / max(1, w) * tiles - 0.5, 0, tiles - 1)
+    i0 = np.floor(gy).astype(int)
+    i1 = np.minimum(i0 + 1, tiles - 1)
+    j0 = np.floor(gx).astype(int)
+    j1 = np.minimum(j0 + 1, tiles - 1)
+    wy = (gy - i0)[:, None]
+    wx = (gx - j0)[None, :]
+    v00 = luts[i0[:, None], j0[None, :], bins]
+    v01 = luts[i0[:, None], j1[None, :], bins]
+    v10 = luts[i1[:, None], j0[None, :], bins]
+    v11 = luts[i1[:, None], j1[None, :], bins]
+    newlum = (v00 * (1 - wy) * (1 - wx) + v01 * (1 - wy) * wx
+              + v10 * wy * (1 - wx) + v11 * wy * wx)
+    scale = np.where(lum > 1 / 255, newlum / np.maximum(lum, 1 / 255), 1.0)
+    out = np.clip(arr * scale[..., None], 0, 255)
+    return Image.fromarray(out.astype(np.uint8), "RGB")
+
+
+def normal_map(tile: np.ndarray, strength: float = 4.0) -> np.ndarray:
+    """Карта нормалей тайла из яркости (градиенты Собеля через np.gradient,
+    OpenGL-ориентация, Y+ вверх). Вход/выход — (n, n, 3) uint8."""
+    rgb = tile[..., :3].astype(np.float64) / 255.0
+    lum = 0.299 * rgb[..., 0] + 0.587 * rgb[..., 1] + 0.114 * rgb[..., 2]
+    d_row, d_col = np.gradient(lum)
+    nx = -d_col * strength
+    ny = -d_row * strength  # Y+ вверх: рост яркости вниз наклоняет вверх
+    nz = np.ones_like(nx)
+    norm = np.sqrt(nx ** 2 + ny ** 2 + nz ** 2)
+    encoded = (np.dstack([nx, ny, nz]) / norm[..., None]) * 0.5 + 0.5
+    return (np.clip(encoded, 0, 1) * 255).astype(np.uint8)
+
+
+def build_autotile_set(grid_a: np.ndarray, grid_b: np.ndarray) -> list[np.ndarray]:
+    """16 blob-тайлов перехода B->A по битам 4 углов (TL, TR, BL, BR).
+    Тайлы смешаны по диагональным ramps, квантизация — на этапе пака."""
+    n = grid_a.shape[0]
+    yy, xx = np.mgrid[0:n, 0:n]
+    tx = xx / max(1, n - 1)
+    ty = yy / max(1, n - 1)
+    ramps = {
+        0: 1 - np.maximum(tx, ty),            # TL
+        1: 1 - np.maximum(1 - tx, ty),        # TR
+        2: 1 - np.maximum(tx, 1 - ty),        # BL
+        3: 1 - np.maximum(1 - tx, 1 - ty),    # BR
+    }
+    tiles = []
+    for bits in range(16):
+        weight = np.zeros((n, n))
+        for bit in range(4):
+            if bits >> bit & 1:
+                weight = np.maximum(weight, ramps[bit])
+        mixed = grid_b * weight[..., None] + grid_a * (1 - weight[..., None])
+        tiles.append(np.clip(mixed, 0, 255).astype(np.uint8))
+    return tiles
+
+
+def extract_frames(data: bytes, max_frames: int = 12) -> list[Image.Image]:
+    """Раскадровать GIF/WebP (Pillow) или MP4 (imageio) — до max_frames
+    кадров, выбранных равномерно по всей длительности."""
+    try:
+        img = Image.open(io.BytesIO(data))
+        if getattr(img, "is_animated", False) and img.n_frames > 1:
+            indices = np.linspace(0, img.n_frames - 1, min(img.n_frames, max_frames)).astype(int)
+            frames = []
+            for index in indices:
+                img.seek(int(index))
+                frames.append(_flatten_to_rgb(img.copy(), keep_alpha=True).convert("RGB"))
+            return frames
+    except UnsupportedMediaError:
+        raise
+    except Exception:
+        pass  # не анимация для Pillow — пробуем как видео
+    try:
+        import imageio.v3 as iio
+
+        collected = []
+        for frame in iio.imiter(io.BytesIO(data), extension=".mp4"):
+            collected.append(np.asarray(frame)[..., :3])
+            if len(collected) >= max_frames * 4:
+                break
+        if not collected:
+            raise UnsupportedMediaError("кадры не найдены")
+        pick = np.linspace(0, len(collected) - 1, min(max_frames, len(collected))).astype(int)
+        return [Image.fromarray(np.asarray(collected[i]), "RGB") for i in pick]
+    except ImportError as exc:
+        raise UnsupportedMediaError("модуль imageio не установлен") from exc
+    except UnsupportedMediaError:
+        raise
+    except Exception as exc:
+        raise UnsupportedMediaError("не удалось раскадровать") from exc
+
+
+def build_sprite_sheet(
+    frames: list[Image.Image],
+    grid: int,
+    palette: tuple | None,
+    dither: str,
+    colors: int = 32,
+) -> tuple[bytes, bytes]:
+    """Спрайт-лист: все кадры в одной общей палитре, горизонтальная лента
+    PNG нативного размера + увеличенное превью. Возвращает (png, preview)."""
+    grids = []
+    for frame in frames:
+        small = frame.resize((grid, grid), Image.Resampling.BOX)
+        grids.append(np.clip(np.asarray(small.convert("RGB"), dtype=np.float64), 0, 255).astype(np.uint8))
+    palette_res = palette or shared_palette_from_grids(grids, colors)
+    tiles = [render_pack_tile(g, palette_res, dither) for g in grids]
+    strip = np.concatenate(tiles, axis=1)
+    png_buffer = io.BytesIO()
+    Image.fromarray(strip, "RGB").save(png_buffer, "PNG", optimize=True)
+    preview = np.kron(strip, np.ones((4, 4, 1), dtype=np.uint8))
+    preview_buffer = io.BytesIO()
+    Image.fromarray(preview, "RGB").save(preview_buffer, "PNG", optimize=True)
+    return png_buffer.getvalue(), preview_buffer.getvalue()
 
 
 # ---------------------------------------------------------------- эффекты и экспорт
@@ -503,17 +733,6 @@ def resize_for_sticker(png_bytes: bytes, max_side: int = STICKER_MAX_SIDE) -> by
     return buffer.getvalue()
 
 
-def _map_to_fixed_palette(img: Image.Image, colors: tuple, dither: bool) -> Image.Image:
-    """Сопоставить каждому пикселю ближайший цвет палитры (векторно, redmean)."""
-    pixels = np.asarray(img, dtype=np.float64)
-    if dither:
-        pixels = np.clip(pixels + _bayer_offsets(*img.size)[..., None], 0.0, 255.0)
-    flat = pixels.reshape(-1, 3)
-    palette = as_numpy(colors)
-    mapped = _nearest_palette(flat, palette).reshape(img.size[1], img.size[0], 3)
-    return Image.fromarray(mapped, "RGB")
-
-
 def _nearest_palette(pixels: np.ndarray, palette: np.ndarray) -> np.ndarray:
     """Ближайший цвет палитры для каждого пикселя, redmean в numpy.
 
@@ -536,18 +755,6 @@ def _nearest_palette(pixels: np.ndarray, palette: np.ndarray) -> np.ndarray:
     return palette[np.argmin(dist, axis=1)]
 
 
-def _bayer_offsets(width: int, height: int) -> np.ndarray:
-    """Пороговая матрица Bayer 4x4, размноженная на весь кадр (диапазон -0.5..0.5)."""
-    normalized = (_BAYER_4X4 + 0.5) / 16.0 - 0.5
-    tiles_y = math.ceil(height / 4)
-    tiles_x = math.ceil(width / 4)
-    tiled = np.tile(normalized, (tiles_y, tiles_x))[:height, :width]
-    return tiled * DITHER_STRENGTH
-
-
-# ---------------------------------------------------------------- рендер результата
-
-
 def render(
     source: bytes,
     settings: Settings,
@@ -567,6 +774,7 @@ def render(
         palette=settings.palette,
         n_colors=settings.n_colors,
         dither=settings.dither,
+        enhance_details=settings.clahe,
         contrast=settings.contrast,
         saturation=settings.saturation,
         sharpness=settings.sharpness,
