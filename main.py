@@ -47,7 +47,7 @@ def main() -> None:
 
     bot = Bot(token, default=DefaultBotProperties(parse_mode=None))
     # корректное завершение по SIGINT/SIGTERM внутри run_polling
-    dp.run_polling(bot, allowed_updates=["message", "callback_query", "inline_query"])
+    dp.run_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":

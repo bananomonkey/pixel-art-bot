@@ -328,6 +328,87 @@ def test_all_bot_methods_exist():
     assert not missing, f"несуществующие методы Bot: {missing}"
 
 
+def test_pack_session_flow(env):
+    """/pack -> фото идут в буфер без пикселизации -> /packdone отдаёт zip+превью."""
+    handlers.pack_sessions.clear()
+    uid = 21
+
+    def _msg(mid, file_id="p1"):
+        return Message(
+            message_id=mid,
+            chat=Chat(id=env.chat_id, type="private"),
+            date=datetime.now(timezone.utc),
+            from_user=User(id=uid, is_bot=False, first_name="t"),
+            photo=[PhotoSize(file_id=file_id, file_unique_id="u", width=100, height=100)],
+        )
+
+    async def _noop(*a, **kw):
+        return None
+
+    start = SimpleNamespace(chat=SimpleNamespace(id=env.chat_id), from_user=SimpleNamespace(id=uid))
+    start.answer = _noop
+    _run(handlers.cmd_pack(start))
+    assert uid in handlers.pack_sessions
+    # фото (в т.ч. «альбом») добавляются без рендера
+    env.bot.calls.clear()
+    for i in range(3):
+        _run(handlers.on_photo(_msg(50 + i, f"pf{i}"), env.bot))
+    assert len(handlers.pack_sessions[uid]) == 3
+    assert not any(name == "send_photo" for name, *_ in env.bot.calls)  # пикселизации не было
+    # сборка
+    done = SimpleNamespace(chat=SimpleNamespace(id=env.chat_id), from_user=SimpleNamespace(id=uid))
+    done.answer = _noop
+    env.bot.calls.clear()
+    _run(handlers.cmd_packdone(done, env.bot))
+    assert any(name == "send_document" for name, _ in env.bot.calls)
+    assert any(name == "send_photo" for name, *_ in env.bot.calls)  # превью
+    assert uid not in handlers.pack_sessions  # сессия закрыта
+
+
+def test_pack_session_cancel(env):
+    handlers.pack_sessions.clear()
+    uid = 22
+    handlers.pack_sessions[uid] = [b"x", b"y"]
+    cancelled = SimpleNamespace(chat=SimpleNamespace(id=env.chat_id), from_user=SimpleNamespace(id=uid))
+
+    async def _answer(text=None, **kw):
+        return None
+
+    cancelled.answer = _answer
+    _run(handlers.cmd_packcancel(cancelled))
+    assert uid not in handlers.pack_sessions
+
+
+def test_pack_settings_panel(env):
+    handlers.pack_settings.drop(31)
+
+    async def _edit(*a, **kw):
+        return None
+
+    cq = SimpleNamespace(
+        data="pk:grid:32",
+        from_user=SimpleNamespace(id=31),
+        message=SimpleNamespace(
+            chat=SimpleNamespace(id=env.chat_id),
+            edit_text=_edit,
+        ),
+    )
+
+    async def _answer(text=None, show_alert=False):
+        cq.toast = text
+
+    cq.answer = _answer
+    _run(handlers.cb_pack_set(cq))
+    settings = handlers.pack_settings.get(31)
+    assert settings is not None and settings.grid == 32
+    cq.data = "pk:seam:mirror"
+    _run(handlers.cb_pack_set(cq))
+    assert handlers.pack_settings.get(31).seam == "mirror"
+    cq.data = "pk:dither"
+    _run(handlers.cb_pack_set(cq))
+    assert handlers.pack_settings.get(31).dither is True
+
+
 def test_photo_flow_end_to_end(env):
     """Полный путь нового фото: скачивание -> рендер -> отправка с клавиатурой."""
     photos = [

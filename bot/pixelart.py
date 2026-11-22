@@ -311,6 +311,90 @@ def _apply_outline(rgb: np.ndarray, solid: np.ndarray, threshold: int = 40) -> n
     return out
 
 
+# ---------------------------------------------------------------- ассет-паки (текстуры)
+
+
+def square_crop(img: Image.Image) -> Image.Image:
+    """Центральный кроп 1:1 — текстуры в движках квадратные."""
+    width, height = img.size
+    side = min(width, height)
+    left = (width - side) // 2
+    top = (height - side) // 2
+    return img.crop((left, top, left + side, top + side))
+
+
+def make_seamless(arr: np.ndarray, mode: str) -> np.ndarray:
+    """Сделать тайл бесшовным на уровне сетки (до квантизации и дизеринга).
+
+    blend: циклический сдвиг на полширины/полвысоты (np.roll) + блендинг
+    радиальной маской — края гарантированно совпадают с противоположными.
+    mirror: четверть отражается в 2×2 (калейдоскоп — для плитки/узоров).
+    off: без обработки.
+    """
+    height, width = arr.shape[:2]
+    if mode == "blend":
+        rolled = np.roll(arr, (height // 2, width // 2), axis=(0, 1))
+        yy, xx = np.mgrid[0:height, 0:width]
+        # ромбовидная маска от краёв: на всех краевых рядах/столбцах ровно 0,
+        # поэтому шов гарантированно совпадает с противоположной стороной
+        dy = np.minimum(yy, height - 1 - yy) / (height / 2)
+        dx = np.minimum(xx, width - 1 - xx) / (width / 2)
+        mask = np.clip(np.minimum(dy, dx), 0.0, 1.0)[..., None]
+        return arr * mask + rolled * (1.0 - mask)
+    if mode == "mirror":
+        quarter = arr[: height // 2, : width // 2]
+        top = np.concatenate([quarter, quarter[:, ::-1]], axis=1)
+        return np.concatenate([top, top[::-1, :]], axis=0)
+    if mode == "off":
+        return arr
+    raise ValueError(f"неизвестный режим бесшовности: {mode}")
+
+
+def shared_palette_from_grids(grids: list[np.ndarray], n_colors: int) -> tuple:
+    """Одна общая палитра mediancut'ом на ВСЕ тайлы пака — чтобы сочетались."""
+    stacked = np.concatenate(grids, axis=0)
+    quantized = Image.fromarray(stacked, "RGB").quantize(
+        colors=n_colors, method=Image.Quantize.MEDIANCUT, dither=Image.Dither.NONE
+    )
+    palette = quantized.getpalette() or []
+    used = sorted(set(np.asarray(quantized).reshape(-1).tolist()))
+    colors = [tuple(int(v) for v in palette[i * 3 : i * 3 + 3]) for i in used]
+    return tuple(dict.fromkeys(colors))
+
+
+def render_pack_tile(grid_arr: np.ndarray, palette: tuple, dither: bool) -> np.ndarray:
+    """Квантизация тайла в палитру пака; дизеринг — FS по 3×3-размножению
+    (wrap-around), чтобы ошибка распространялась и через швы."""
+    n = grid_arr.shape[0]
+    palette_img = Image.new("P", (1, 1))
+    palette_img.putpalette([v for rgb in palette for v in rgb])
+    if dither:
+        tiled = np.tile(grid_arr, (3, 3, 1))
+        quantized = Image.fromarray(tiled, "RGB").quantize(
+            palette=palette_img, dither=Image.Dither.FLOYDSTEINBERG
+        )
+        return np.asarray(quantized.convert("RGB"))[n : 2 * n, n : 2 * n]
+    quantized = Image.fromarray(grid_arr, "RGB").quantize(
+        palette=palette_img, dither=Image.Dither.NONE
+    )
+    return np.asarray(quantized.convert("RGB"))
+
+
+def contact_sheet(tiles: list[np.ndarray], scale: int = 4) -> Image.Image:
+    """Превью-простыня: все тайлы пака, увеличенные NEAREST'ом."""
+    count = len(tiles)
+    size = tiles[0].shape[0]
+    cols = math.ceil(math.sqrt(count))
+    rows = math.ceil(count / cols)
+    sheet = np.full((rows * size * scale, cols * size * scale, 3), 255, dtype=np.uint8)
+    for index, tile in enumerate(tiles):
+        row, col = divmod(index, cols)
+        up = np.kron(tile, np.ones((scale, scale, 1), dtype=np.uint8))
+        sheet[row * size * scale : (row + 1) * size * scale,
+              col * size * scale : (col + 1) * size * scale] = up
+    return Image.fromarray(sheet, "RGB")
+
+
 # ---------------------------------------------------------------- эффекты и экспорт
 
 

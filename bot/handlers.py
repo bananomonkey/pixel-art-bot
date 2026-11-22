@@ -14,7 +14,7 @@ from dataclasses import replace
 
 from aiogram import Bot, F, Router
 from aiogram.dispatcher.event.bases import SkipHandler
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
@@ -22,9 +22,6 @@ from aiogram.types import (
     ErrorEvent,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    InlineQuery,
-    InlineQueryResultCachedPhoto,
-    InlineQueryResultsButton,
     InputMediaPhoto,
     Message,
 )
@@ -61,7 +58,17 @@ from .config import (
     STATE_TTL_SECONDS,
     USER_STORE_MAX_ENTRIES,
 )
-from .palettes import PALETTE_LABELS, PALETTE_ORDER, parse_hex_colors
+from .pack import (
+    MAX_PACK_PHOTOS,
+    PACK_GRIDS,
+    PackSettings,
+    SEAM_MODES,
+    add_photo,
+    build_asset_pack,
+    pop_photos,
+    sessions as pack_sessions,
+)
+from .palettes import FIXED_PALETTES, PALETTE_LABELS, PALETTE_ORDER, parse_hex_colors
 from .pixelart import (
     GRID_BY_SIZE,
     ImageTooLargeError,
@@ -87,6 +94,7 @@ register_admin_handlers(router)
 store = StateStore(max_entries=STATE_MAX_ENTRIES, ttl_seconds=STATE_TTL_SECONDS)
 favorites = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> Settings
 custom_palettes = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> палитра
+pack_settings = PerUserStore(max_entries=USER_STORE_MAX_ENTRIES)  # user_id -> PackSettings
 _palette_flow: set[int] = set()  # пользователи, ожидающие ввода своей палитры
 _grid_flow: dict[int, tuple[int, int]] = {}  # user_id -> (chat_id, message_id) цели
 _recent_entry: dict[int, tuple[int, int]] = {}  # chat_id -> последнее (chat_id, message_id)
@@ -95,7 +103,6 @@ _last_photo_at: dict[int, float] = {}
 _albums_seen: "OrderedDict[str, None]" = OrderedDict()
 
 _demo_source: bytes | None = None
-_style_previews: dict[str, str] = {}  # палитра -> file_id превью (для инлайна)
 
 # --- реплики ---
 TEXT_NOT_A_PHOTO = "Пришли фото, сделаю пиксель-арт"
@@ -165,6 +172,7 @@ async def cmd_help(message: Message) -> None:
         "✨ Эффекты — обводка, CRT-сканлайны, зерно\n"
         "🖼 Кадр — ✂️ вырезать фон, 🎯 только объект, отступ\n"
         "📤 Экспорт — 🔖 запомнить стиль, 📎 PNG, 🧩 стикер 512, 💧 водяной знак\n\n"
+        "Ассет-паки текстур: /pack → фото → /packdone; настройки — /packset.\n\n"
         "Команды: /palette, /mystyle, /demo, /grid N (свой уровень пикселизации)."
     )
 
@@ -368,6 +376,16 @@ async def on_photo(message: Message, bot: Bot) -> None:
     if uid is None:
         return
     chats.touch(message.chat.id)
+    if uid in pack_sessions:  # режим ассет-пака: фото в буфер, без пикселизации
+        data = await _download(bot, message.photo[-1].file_id)
+        count = add_photo(uid, data)
+        if count is None:
+            await bot.send_message(
+                message.chat.id, f"🧱 Лимит пака — {MAX_PACK_PHOTOS} фото. /packdone — собрать."
+            )
+        else:
+            await bot.send_message(message.chat.id, f"🧱 В паке: {count}/{MAX_PACK_PHOTOS}")
+        return
     album = False
     if message.media_group_id is not None:
         album = _claim_album(message.media_group_id)
@@ -396,6 +414,16 @@ async def on_document(message: Message, bot: Bot) -> None:
         return
     if document.file_size is not None and document.file_size > MAX_FILE_SIZE:
         await message.answer(TEXT_TOO_BIG_FILE)
+        return
+    if uid in pack_sessions:  # режим ассет-пака: файл в буфер
+        data = await _download(bot, document.file_id)
+        count = add_photo(uid, data)
+        if count is None:
+            await bot.send_message(
+                message.chat.id, f"🧱 Лимит пака — {MAX_PACK_PHOTOS} фото. /packdone — собрать."
+            )
+        else:
+            await bot.send_message(message.chat.id, f"🧱 В паке: {count}/{MAX_PACK_PHOTOS}")
         return
     if not _allow_rate(uid):
         await message.answer(TEXT_RATE_LIMIT)
@@ -430,6 +458,9 @@ async def on_animation(message: Message, bot: Bot) -> None:
     if uid is None:
         return
     chats.touch(message.chat.id)
+    if uid in pack_sessions:
+        await message.answer("🧱 Для пака нужны фото (не анимации).")
+        return
     if not _allow_rate(uid):
         await message.answer(TEXT_RATE_LIMIT)
         return
@@ -849,48 +880,167 @@ async def cb_reset_all(callback: CallbackQuery, bot: Bot) -> None:
                  toast="Все настройки сброшены")
 
 
-# ---------------------------------------------------------------- инлайн-режим
+# ---------------------------------------------------------------- ассет-паки
 
 
-@router.inline_query()
-async def on_inline_query(query: InlineQuery, bot: Bot) -> None:
-    """Превью стилей: первый запуск тихо отправляет примеры в личку с ботом."""
-    results = []
-    try:
-        for key in PALETTE_ORDER:
-            file_id = _style_previews.get(key)
-            if file_id is None:
-                file_id = await _upload_preview(bot, query.from_user.id, key)
-                _style_previews[key] = file_id
-            results.append(
-                InlineQueryResultCachedPhoto(
-                    id=f"style_{key}",
-                    photo_file_id=file_id,
-                    title=f"Пиксель-арт · {PALETTE_LABELS[key]}",
-                    description="Нажми, чтобы отправить пример стиля в чат",
-                )
-            )
-    except (TelegramForbiddenError, TelegramBadRequest):
-        results = []  # бот не запущен пользователем — покажем кнопку запуска
-    await query.answer(
-        results,
-        cache_time=300,
-        button=InlineQueryResultsButton(
-            switch_pm_text="▶️ Запусти бота", switch_pm_parameter="start"
+@router.message(Command("pack"))
+async def cmd_pack(message: Message) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    chats.touch(message.chat.id)
+    if uid in pack_sessions:
+        count = len(pack_sessions[uid])
+        await message.answer(
+            f"🧱 Сессия пака уже идёт: {count}/{MAX_PACK_PHOTOS} фото.\n"
+            "/packdone — собрать, /packcancel — отмена, /packset — настройки."
+        )
+        return
+    pack_sessions[uid] = []
+    await message.answer(
+        "🧱 Режим ассет-пака включён.\n\n"
+        "Пришли фото-текстуры — альбомом или по одному (до 20).\n"
+        "Каждое станет бесшовным тайлом; индивидуальные настройки пикселизации "
+        "в этом режиме не применяются — пак собирается по общим настройкам.\n\n"
+        "/packdone — собрать пак (zip + превью)\n"
+        "/packset — настройки (размер, бесшовность, палитра, дизеринг)\n"
+        "/packcancel — отмена"
+    )
+
+
+@router.message(Command("packdone"))
+async def cmd_packdone(message: Message, bot: Bot) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    sources = pop_photos(uid)
+    if not sources:
+        await message.answer("Сессия пака пуста. /pack — начать заново.")
+        return
+    settings = pack_settings.get(uid) or PackSettings()
+    custom = None
+    if settings.palette == "custom":
+        custom = custom_palettes.get(uid)
+        if custom is None:
+            pack_sessions[uid] = sources  # сессия не потерялась
+            await message.answer("Своя палитра не задана — /palette. Сессия сохранена.")
+            return
+    await bot.send_message(message.chat.id, f"🧱 Собираю пак: {len(sources)} тайлов…")
+    async with _jobs:
+        zip_bytes, preview = await asyncio.to_thread(build_asset_pack, sources, settings, custom)
+    await bot.send_document(
+        chat_id=message.chat.id,
+        document=BufferedInputFile(zip_bytes, filename=f"asset_pack_{settings.grid}x{settings.grid}.zip"),
+        caption=(
+            f"📦 {len(sources)} тайлов · {settings.grid}×{settings.grid} · "
+            f"бесшовность: {SEAM_MODES[settings.seam]} · {settings.palette_label()} · "
+            f"дизеринг {'вкл' if settings.dither else 'выкл'}"
         ),
     )
-
-
-async def _upload_preview(bot: Bot, chat_id: int, palette_key: str) -> str:
-    source = await _get_demo_source()
-    async with _jobs:
-        png = await asyncio.to_thread(render, source, Settings(palette=palette_key), None)
-    message = await bot.send_photo(
-        chat_id,
-        BufferedInputFile(png, filename=f"preview_{palette_key}.png"),
-        disable_notification=True,
+    await bot.send_photo(
+        chat_id=message.chat.id,
+        photo=BufferedInputFile(preview, filename="pack_preview.png"),
+        caption=f"🖼 Превью (×{max(1, 512 // settings.grid)})",
     )
-    return message.photo[-1].file_id
+
+
+@router.message(Command("packcancel"))
+async def cmd_packcancel(message: Message) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    dropped = pop_photos(uid)
+    await message.answer(
+        f"🧱 Сессия отменена, забыты фото: {len(dropped)} шт." if dropped else "Активной сессии пака нет."
+    )
+
+
+@router.message(Command("packset"))
+async def cmd_packset(message: Message) -> None:
+    uid = _user_ok(message)
+    if uid is None:
+        return
+    chats.touch(message.chat.id)
+    settings = pack_settings.get(uid) or PackSettings()
+    await message.answer(_pack_text(settings), reply_markup=_pack_keyboard(settings))
+
+
+def _pack_text(settings: PackSettings) -> str:
+    return (
+        "🧱 Настройки ассет-пака\n\n"
+        f"Размер тайла: {settings.grid}×{settings.grid}\n"
+        f"Бесшовность: {SEAM_MODES[settings.seam]}\n"
+        f"Палитра: {settings.palette_label()}\n"
+        f"Дизеринг: {'вкл' if settings.dither else 'выкл'}\n\n"
+        "Тайлы — квадратные PNG 1:1 натурального размера (без апскейла, "
+        "движки масштабируют сами), бесшовные.\n"
+        "/pack — начать, /packdone — собрать, /packcancel — отмена."
+    )
+
+
+def _pack_keyboard(settings: PackSettings) -> InlineKeyboardMarkup:
+    grid_row = [
+        InlineKeyboardButton(
+            text=_mark(f"{grid}×{grid}", settings.grid == grid), callback_data=f"pk:grid:{grid}"
+        )
+        for grid in PACK_GRIDS
+    ]
+    seam_row = [
+        InlineKeyboardButton(
+            text=_mark(label, settings.seam == key), callback_data=f"pk:seam:{key}"
+        )
+        for key, label in SEAM_MODES.items()
+    ]
+    palette_buttons = []
+    for key in ("auto", "custom", *FIXED_PALETTES.keys()):
+        if key == "auto":
+            label = "Авто (общая)"
+        elif key == "custom":
+            label = "Свои"
+        else:
+            label = PALETTE_LABELS[key]
+        palette_buttons.append(
+            InlineKeyboardButton(
+                text=_mark(label, settings.palette == key), callback_data=f"pk:pal:{key}"
+            )
+        )
+    palette_rows = [palette_buttons[i : i + 3] for i in range(0, len(palette_buttons), 3)]
+    dither_row = [
+        InlineKeyboardButton(
+            text=f"Дизеринг: {'вкл' if settings.dither else 'выкл'}", callback_data="pk:dither"
+        )
+    ]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[grid_row, seam_row, dither_row, *palette_rows]
+    )
+
+
+@router.callback_query(F.data.startswith("pk:"))
+async def cb_pack_set(callback: CallbackQuery) -> None:
+    """Панель настроек ассет-пака: размер, бесшовность, палитра, дизеринг."""
+    uid = callback.from_user.id if callback.from_user else None
+    if uid is None:
+        await callback.answer()
+        return
+    parts = (callback.data or "").split(":")
+    settings = pack_settings.get(uid) or PackSettings()
+    if len(parts) == 3 and parts[1] == "grid" and parts[2].isdigit() and int(parts[2]) in PACK_GRIDS:
+        settings.grid = int(parts[2])
+    elif len(parts) == 3 and parts[1] == "seam" and parts[2] in SEAM_MODES:
+        settings.seam = parts[2]
+    elif len(parts) == 3 and parts[1] == "pal" and (parts[2] in ("auto", "custom") or parts[2] in FIXED_PALETTES):
+        settings.palette = parts[2]
+    elif len(parts) == 2 and parts[1] == "dither":
+        settings.dither = not settings.dither
+    else:
+        await callback.answer()
+        return
+    pack_settings.put(uid, settings)
+    try:
+        await callback.message.edit_text(_pack_text(settings), reply_markup=_pack_keyboard(settings))
+    except TelegramBadRequest:
+        pass  # «message is not modified» и подобное
+    await callback.answer()
 
 
 # ---------------------------------------------------------------- демо-исходник
