@@ -242,13 +242,14 @@ async def cmd_unban(message: Message, command: CommandObject | None = None) -> N
 
 
 async def admin_capture(message: Message) -> None:
-    """Перехватывает сообщения админа во время флоу; вне флоу пропускает."""
+    """Перехватывает сообщения админа во время флоу; вне флоу пропускает дальше.
+
+    Важно: вне флоу — всегда SkipHandler (и текст, и фото), иначе админский
+    перехватчик съедает сообщения раньше флоу сетки/палитры и обычных фото.
+    """
     flow = _flow.get(message.from_user.id)  # type: ignore[union-attr]
     if flow is None:
-        if message.text:
-            await message.answer("Нет активного действия. Отправь фото или открой /admin")
-            return
-        raise SkipHandler  # фото/файл без флоу — обычная обработка пиксель-арта
+        raise SkipHandler
 
     if flow["stage"] == "post":
         if message.media_group_id is not None:

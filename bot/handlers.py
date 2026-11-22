@@ -263,7 +263,8 @@ async def cmd_demo(message: Message, bot: Bot) -> None:
     )
     async with _jobs:
         png = await asyncio.to_thread(render, source, settings, None)
-    sent = await message.answer_photo(
+    sent = await bot.send_photo(
+        message.chat.id,
         BufferedInputFile(png, filename="pixel_demo.png"),
         caption="🎲 Демо: " + _caption(settings),
         reply_markup=_keyboard(settings),

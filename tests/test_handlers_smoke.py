@@ -9,6 +9,7 @@ import pytest
 
 from aiogram.types import Chat, Message, PhotoSize, User
 
+from bot import admin as bot_admin
 from bot import handlers
 from bot.admin import stats
 from bot.state import Settings
@@ -256,7 +257,62 @@ def test_reset_all(env):
     assert entry.view == "main"
 
 
-def test_size_custom_flow(env):
+def test_admin_capture_does_not_block_grid_flow(env):
+    """Регрессия: админский перехватчик съедал текст админа до флоу сетки —
+    «📏 Свой» не работал для админов. Теперь вне админ-флоу всегда SkipHandler."""
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    admin_uid = 424242  # ADMIN_IDS из conftest
+    cq = _callback(env, "size:custom", uid=admin_uid)
+    _run(handlers.cb_size_custom(cq))
+    assert admin_uid in handlers._grid_flow
+
+    answered = []
+
+    class FakeMessage(SimpleNamespace):
+        async def answer(self, text):
+            answered.append(text)
+
+    msg = FakeMessage(from_user=SimpleNamespace(id=admin_uid), text="256")
+    # порядок как в проде: admin_capture стоит в цепочке раньше grid_capture
+    with pytest.raises(SkipHandler):
+        _run(bot_admin.admin_capture(msg))
+    _run(handlers.grid_capture(msg, env.bot))
+    entry = handlers.store.get(env.chat_id, env.message_id)
+    assert entry.settings.pixel_size == "custom" and entry.settings.custom_grid == 256
+    assert not any("Нет активного действия" in (t or "") for t in answered), answered
+    assert any("Свой уровень" in (t or "") for t in answered), answered
+
+
+def test_admin_capture_does_not_block_palette_flow(env):
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    admin_uid = 424242
+    handlers._palette_flow.add(admin_uid)
+    answered = []
+
+    class FakeMessage(SimpleNamespace):
+        async def answer(self, text):
+            answered.append(text)
+
+    msg = FakeMessage(
+        from_user=SimpleNamespace(id=admin_uid),
+        text="#FF004D 00E436 7E2553",
+        media_group_id=None,
+        photo=None,
+        document=None,
+    )
+    with pytest.raises(SkipHandler):
+        _run(bot_admin.admin_capture(msg))
+    _run(handlers.palette_capture(msg, bot=None))
+    assert admin_uid not in handlers._palette_flow
+    palette = handlers.custom_palettes.get(admin_uid)
+    assert palette is not None and len(palette) == 3
+    assert not any("Нет активного действия" in (t or "") for t in answered), answered
+    handlers.custom_palettes.drop(admin_uid)
+
+
+def test_grid_flow_applies_number(env):
     """📏 Свой: кнопка ставит флоу, число применяет свой уровень к той же картинке."""
     cq = _callback(env, "size:custom")
     _run(handlers.cb_size_custom(cq))
