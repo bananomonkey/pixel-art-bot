@@ -10,8 +10,6 @@ import logging
 import random
 import time
 
-import numpy as np
-from PIL import Image
 from collections import OrderedDict
 from dataclasses import replace
 
@@ -83,6 +81,7 @@ from .pixelart import (
     parse_grid,
     render,
     resize_for_sticker,
+    tiled_preview,
 )
 from .state import COLOR_STEPS, PerUserStore, SIZE_LABELS, SIZE_ORDER, Settings, StateStore
 
@@ -130,6 +129,8 @@ _ADJUSTMENTS = {
 # корректируемые кнопками ± целочисленные параметры кадра
 _GRID_STEP = 8  # шаг кнопок «Сетка −/+»
 _CROP_MODES = ("off", "fill", "pad")  # весь кадр | объект крупно | объект с полем
+_OUTLINE_LABELS = {"off": "выкл", "dark": "тёмная", "volume": "объёмная"}
+_SEAM_LABELS = {"off": "выкл", "blend": "блендинг", "mirror": "зеркало"}
 _VIEWS = ("main", "palettes", "adjust", "effects", "frame", "export", "grid")
 
 
@@ -741,10 +742,10 @@ async def cb_adjust(callback: CallbackQuery, bot: Bot) -> None:
         await _stale(callback)
         return
     chat_id, message_id, entry = loaded
-    if (callback.data or "") == "adj:clahe":
-        settings = replace(entry.settings, clahe=not entry.settings.clahe)
+    if (callback.data or "") == "adj:details":
+        settings = replace(entry.settings, details=not entry.settings.details)
         await _apply(callback, bot, chat_id, message_id, entry, settings,
-                     toast="🪄 Локальный контраст: вкл" if settings.clahe else "🪄 Локальный контраст: выкл")
+                     toast="Чёткость деталей: вкл" if settings.details else "Чёткость деталей: выкл")
         return
     try:
         _, kind, sign = (callback.data or "").split(":")
@@ -944,7 +945,16 @@ async def cb_effect(callback: CallbackQuery, bot: Bot) -> None:
         return
     chat_id, message_id, entry = loaded
     kind = (callback.data or "").split(":", 1)[-1]
-    field = {"outline": "outline", "crt": "crt", "grain": "grain", "grid": "show_grid"}.get(kind)
+    if kind == "outline":  # цикл: выкл -> тёмный контур -> объёмный -> выкл
+        modes = ("off", "dark", "volume")
+        index = modes.index(entry.settings.outline) if entry.settings.outline in modes else 0
+        settings = replace(entry.settings, outline=modes[(index + 1) % len(modes)])
+        toasts = {"off": "Обводка: выкл", "dark": "Обводка: тёмный контур",
+                  "volume": "Обводка объёмная (свет сверху, тень снизу)"}
+        await _apply(callback, bot, chat_id, message_id, entry, settings,
+                     toast=toasts[settings.outline])
+        return
+    field = {"crt": "crt", "grain": "grain", "grid": "show_grid"}.get(kind)
     if field is None:
         await callback.answer()
         return
@@ -981,26 +991,29 @@ async def cb_frame(callback: CallbackQuery, bot: Bot) -> None:
                      toast=toasts[settings.crop_mode])
         return
     if action == "tiled":
-        # проверка бесшовности: текущий результат, склеенный 3×3
+        # проверка бесшовности: результат, сложенный мозаикой 3×3
         async with _jobs:
             png = await asyncio.to_thread(
-                render, entry.source, entry.settings, entry.custom_palette, flatten=True
+                tiled_preview, entry.source, entry.settings, entry.custom_palette
             )
-            img = Image.open(io.BytesIO(png)).convert("RGB")
-            gw = _effective_grid(entry.settings)
-            small = img.resize((gw, gw), Image.Resampling.BOX)
-            big = np.kron(np.asarray(small), np.ones((3, 3, 1), dtype=np.uint8))
-            scale = max(1, round(1024 / big.shape[0]))
-            tiled = np.kron(big, np.ones((scale, scale, 1), dtype=np.uint8))
-        tiled_img = Image.fromarray(tiled.astype(np.uint8), "RGB")
-        bio = io.BytesIO()
-        tiled_img.save(bio, "PNG", optimize=True)
         await bot.send_photo(
             chat_id,
-            BufferedInputFile(bio.getvalue(), filename="tile_3x3.png"),
-            caption="🔀 Проверка стыков: если швов не видно — тайл бесшовный",
+            BufferedInputFile(png, filename="tile_3x3.png"),
+            caption="Мозаика 3×3: если швов не видно — тайл бесшовный",
         )
         await callback.answer()
+        return
+    if action == "seamless":
+        modes = ("off", "blend", "mirror")
+        index = modes.index(entry.settings.seamless) if entry.settings.seamless in modes else 0
+        settings = replace(entry.settings, seamless=modes[(index + 1) % len(modes)])
+        toasts = {
+            "off": "Обычный результат (без бесшовности)",
+            "blend": "Бесшовный тайл: края сходятся (блендинг)",
+            "mirror": "Бесшовный тайл: зеркало (для плитки и узоров)",
+        }
+        await _apply(callback, bot, chat_id, message_id, entry, settings,
+                     toast=toasts[settings.seamless])
         return
     await callback.answer()
 
@@ -1343,8 +1356,8 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
                 [InlineKeyboardButton(text="Резк −", callback_data="adj:shp:m"),
                  InlineKeyboardButton(text="Резк +", callback_data="adj:shp:p")],
                 [InlineKeyboardButton(
-                    text=f"🪄 Детали: {'вкл' if settings.clahe else 'выкл'}",
-                    callback_data="adj:clahe")],
+                    text=_mark("Чёткость деталей", settings.details),
+                    callback_data="adj:details")],
                 [InlineKeyboardButton(text="↺ Сброс корр.", callback_data="adj_reset")],
                 *back,
             ]
@@ -1363,7 +1376,8 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
     if view == "effects":
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=_mark("Обводка", settings.outline), callback_data="eff:outline"),
+                [InlineKeyboardButton(text="Обводка: " + _OUTLINE_LABELS.get(settings.outline, "выкл"),
+                                      callback_data="eff:outline"),
                  InlineKeyboardButton(text=_mark("CRT", settings.crt), callback_data="eff:crt"),
                  InlineKeyboardButton(text=_mark("Зерно", settings.grain), callback_data="eff:grain")],
                 [InlineKeyboardButton(text=_mark("#️⃣ Показать сетку", settings.show_grid), callback_data="eff:grid")],
@@ -1385,6 +1399,8 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
                 [InlineKeyboardButton(
                     text=f"🎯 Кадр: {crop_labels[settings.crop_mode] if settings.crop_mode in crop_labels else 'Весь кадр'}",
                     callback_data="frame:crop")],
+                [InlineKeyboardButton(text="🧱 Бесшовный: " + _SEAM_LABELS.get(settings.seamless, "выкл"),
+                                      callback_data="frame:seamless")],
                 [InlineKeyboardButton(text="🔀 Проверка 3×3 (стыки)", callback_data="frame:tiled")],
                 *back,
             ]
@@ -1407,8 +1423,8 @@ def _keyboard(settings: Settings, view: str = "main") -> InlineKeyboardMarkup:
         or settings.saturation != DEFAULT_SATURATION
         or settings.sharpness != DEFAULT_SHARPNESS
     )
-    effects_done = settings.outline or settings.crt or settings.grain or settings.show_grid
-    frame_done = settings.cut_bg or settings.crop_mode != "off"
+    effects_done = settings.outline != "off" or settings.crt or settings.grain or settings.show_grid
+    frame_done = settings.cut_bg or settings.crop_mode != "off" or settings.seamless != "off"
     export_done = settings.sticker or settings.watermark
     size_row = [
         InlineKeyboardButton(
@@ -1466,6 +1482,10 @@ def _caption(settings: Settings) -> str:
         extras.append("объект крупно")
     elif settings.crop_mode == "pad":
         extras.append("объект с полем")
+    if settings.seamless != "off":
+        extras.append("бесшовный тайл")
+    if settings.outline != "off":
+        extras.append("обводка " + _OUTLINE_LABELS[settings.outline])
     if settings.contrast != DEFAULT_CONTRAST:
         extras.append(f"контраст {settings.contrast:g}")
     if settings.saturation != DEFAULT_SATURATION:

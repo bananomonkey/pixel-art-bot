@@ -37,16 +37,16 @@ class Settings:
     palette: str = "auto"  # auto | gameboy | nes | pico8 | c64 | bw | bw1 | zx | sweetie | cga | custom
     n_colors: int = 16  # только для «Авто», одно из COLOR_STEPS
     dither: str = "off"  # off | fs | atkinson | bayer
-    clahe: bool = False  # локальный контраст («🪄 Детали»)
+    details: bool = False  # чёткость мелких деталей
     contrast: float = DEFAULT_CONTRAST
     saturation: float = DEFAULT_SATURATION
     sharpness: float = DEFAULT_SHARPNESS
     # кадр и фон (порог подбирается автоматически: bg_tolerance=0)
     cut_bg: bool = False  # вырезать фон (flood fill от краёв)
-    bg_tolerance: int = 0  # 0 — авто; вручную не выставляется из UI
     crop_mode: str = "off"  # off (весь кадр) | fill (объект крупно) | pad (объект с полем)
     # эффекты
-    outline: bool = False  # обводка объекта
+    outline: str = "off"  # off | dark (тёмный контур) | volume (со светом/тенью)
+    seamless: str = "off"  # off | blend | mirror — бесшовный тайл
     crt: bool = False  # сканлайны
     grain: bool = False  # зерно
     show_grid: bool = False  # подсветка границ пикселей

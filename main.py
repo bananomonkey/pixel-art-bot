@@ -6,6 +6,7 @@ import os
 import sys
 
 from aiogram import Bot, Dispatcher
+from aiogram.types import BotCommand
 from aiogram.client.default import DefaultBotProperties
 
 from bot.admin import broadcast_worker
@@ -17,6 +18,21 @@ _tasks: list[asyncio.Task] = []
 async def _on_startup(bot: Bot) -> None:
     _tasks.append(asyncio.create_task(periodic_purge()))
     _tasks.append(asyncio.create_task(broadcast_worker(bot)))
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Пришли фото — получишь пиксель-арт"),
+        BotCommand(command="help", description="Как пользоваться и какие палитры"),
+        BotCommand(command="palette", description="Своя палитра: hex, файл .hex или фото"),
+        BotCommand(command="mystyle", description="Показать/сбросить сохранённый стиль"),
+        BotCommand(command="demo", description="Попробовать на примере"),
+        BotCommand(command="grid", description="Свой уровень пикселизации: /grid 48"),
+        BotCommand(command="pack", description="Ассет-пак: собрать тайлы из фото"),
+        BotCommand(command="packdone", description="Пак: закончить и собрать zip"),
+        BotCommand(command="packset", description="Пак: настройки (размер, бесшовность)"),
+        BotCommand(command="packcancel", description="Пак: отменить сессию"),
+        BotCommand(command="sheet", description="Спрайт-лист из GIF/MP4"),
+        BotCommand(command="sheetdone", description="Спрайт-лист: закончить и собрать"),
+        BotCommand(command="sheetcancel", description="Спрайт-лист: отменить"),
+    ])
     logging.info("бот запущен (long polling)")
 
 

@@ -315,7 +315,7 @@ def test_clahe_changes_render():
     _gradient().save(bio, "JPEG", quality=92)
     data = bio.getvalue()
     plain = render(data, _S(cut_bg=True, crop_mode="fill"), flatten=True)
-    enhanced = render(data, _S(cut_bg=True, crop_mode="fill", clahe=True), flatten=True)
+    enhanced = render(data, _S(cut_bg=True, crop_mode="fill", details=True), flatten=True)
     assert plain != enhanced
 
 

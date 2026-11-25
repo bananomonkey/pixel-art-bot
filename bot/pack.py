@@ -19,6 +19,7 @@ from .pixelart import (
     contact_sheet,
     decode_source,
     make_seamless,
+    mosaic_sheet,
     normal_map,
     render_pack_tile,
     shared_palette_from_grids,
@@ -158,7 +159,9 @@ def build_asset_pack(
             solid = tile[..., 3:4] >= 128
             tile = np.where(solid, tile[..., :3], 255).astype(np.uint8)
         rgb_tiles.append(tile)
-    preview = contact_sheet(rgb_tiles, scale=max(1, 512 // settings.grid))
+    # превью: каждый тайл мозаикой 3×3 (стыки видно сразу); авто-тайлы по отдельности
+    preview = (contact_sheet(rgb_tiles, scale=max(1, 512 // settings.grid)) if autotile
+               else mosaic_sheet(tiles))
     preview_buffer = io.BytesIO()
     preview.save(preview_buffer, "PNG", optimize=True)
     return buffer.getvalue(), preview_buffer.getvalue()

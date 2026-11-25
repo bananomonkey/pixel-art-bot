@@ -181,7 +181,7 @@ def test_menu_opens_submenus_without_render(env):
 
 
 def test_effects(env):
-    for data, field in (("eff:outline", "outline"), ("eff:crt", "crt"), ("eff:grain", "grain")):
+    for data, field in (("eff:crt", "crt"), ("eff:grain", "grain")):
         env.bot.calls.clear()
         cq = _callback(env, data)
         _run(handlers.cb_effect(cq, env.bot))
@@ -189,15 +189,26 @@ def test_effects(env):
         assert getattr(handlers.store.get(env.chat_id, env.message_id).settings, field) is True
 
 
+def test_outline_cycles_modes(env):
+    _run(handlers.cb_effect(_callback(env, "eff:outline"), env.bot))
+    assert handlers.store.get(env.chat_id, env.message_id).settings.outline == "dark"
+    _run(handlers.cb_effect(_callback(env, "eff:outline"), env.bot))
+    assert handlers.store.get(env.chat_id, env.message_id).settings.outline == "volume"
+    _run(handlers.cb_effect(_callback(env, "eff:outline"), env.bot))
+    assert handlers.store.get(env.chat_id, env.message_id).settings.outline == "off"
+
+
 def test_frame_toggles_and_modes(env):
     _run(handlers.cb_frame(_callback(env, "frame:bg"), env.bot))
     assert handlers.store.get(env.chat_id, env.message_id).settings.cut_bg is True
-    # порог теперь авто: остаётся 0 (подбирается сам)
-    assert handlers.store.get(env.chat_id, env.message_id).settings.bg_tolerance == 0
     # кадр циклится: off -> fill -> pad -> off
     for expected in ("fill", "pad", "off"):
         _run(handlers.cb_frame(_callback(env, "frame:crop"), env.bot))
         assert handlers.store.get(env.chat_id, env.message_id).settings.crop_mode == expected
+    # бесшовность циклится: off -> blend -> mirror -> off
+    for expected in ("blend", "mirror", "off"):
+        _run(handlers.cb_frame(_callback(env, "frame:seamless"), env.bot))
+        assert handlers.store.get(env.chat_id, env.message_id).settings.seamless == expected
 
 
 def test_grid_plus_minus(env):

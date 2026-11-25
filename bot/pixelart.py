@@ -6,6 +6,7 @@
 
 import io
 import math
+from collections import OrderedDict
 
 import numpy as np
 from PIL import Image, ImageDraw, ImageEnhance, ImageOps
@@ -209,19 +210,19 @@ def make_pixel_art(
     sharpness: float = DEFAULT_SHARPNESS,
     palette_colors: tuple | None = None,
     cut_bg: bool = False,
-    enhance_details: bool = False,
-    bg_tolerance: int = 0,
     crop_object: bool = False,
     padding: int = 10,
-    outline: bool = False,
+    outline: str = "off",
+    seamless: str = "off",
+    details: bool = False,
     show_grid: bool = False,
-) -> Image.Image:
-    """Пикселизация RGB-изображения: фон/кадр -> сетка -> квантизация -> квадраты.
+    return_grid: bool = False,
+):
+    """Пикселизация: фон/кадр -> сетка -> бесшовность -> квантизация -> квадраты.
 
-    Возвращает RGBA (при вырезке фона) или RGB, большая сторона — целое кратное
-    размера сетки и близка к RESULT_MAX_SIDE. pixel_size="custom" использует
-    custom_grid (свой уровень пикселизации, GRID_MIN..GRID_MAX). bg_tolerance=0 —
-    порог фона подбирается автоматически. show_grid — подсветка границ пикселей.
+    Возвращает RGB/RGBA-изображение (большая сторона — целое кратное сетки,
+    около RESULT_MAX_SIDE), а при return_grid=True — (rgb, solid) сетки без
+    увеличения. outline: off | dark | volume; seamless: off | blend | mirror.
     """
     if pixel_size in GRID_BY_SIZE:
         grid_level = GRID_BY_SIZE[pixel_size]
@@ -235,17 +236,25 @@ def make_pixel_art(
         raise ValueError(f"неизвестная палитра: {palette}")
     n_colors = max(2, min(64, int(n_colors)))
 
-    # 0) локальный контраст (CLAHE) и коррекции
-    source = _clahe(img) if enhance_details else img
+    # 1) маска фона — по исходнику, без коррекций: не зависит от регуляторов
+    original = np.asarray(img.convert("RGB")).astype(np.float64)
+    mask = None
+    if cut_bg or crop_object or outline != "off":
+        found, _share = _background_mask(original)
+        if found.any():
+            mask = found
+
+    # 2) чёткость деталей и коррекции
+    source = _enhance_details(img) if details else img
     adjusted = ImageEnhance.Contrast(source).enhance(contrast)
     adjusted = ImageEnhance.Color(adjusted).enhance(saturation)
     adjusted = ImageEnhance.Sharpness(adjusted).enhance(sharpness)
 
-    # 1) фон и кадр (возвращает RGBA)
-    framed = _frame_image(adjusted, cut_bg, bg_tolerance, crop_object, padding)
+    # 3) фон и кадр
+    arr, alpha, mask = _frame_image(adjusted, cut_bg, crop_object, padding, mask)
+    width, height = arr.shape[1], arr.shape[0]
 
-    # 2) размер сетки с сохранением пропорций
-    width, height = framed.size
+    # 4) размер сетки с сохранением пропорций
     grid_big = min(grid_level, max(width, height))
     if width >= height:
         grid_w = grid_big
@@ -254,35 +263,52 @@ def make_pixel_art(
         grid_h = grid_big
         grid_w = max(1, round(width * grid_big / height))
 
-    # 3) premultiplied BOX-усреднение до сетки (чтобы прозрачность не «замыливала» цвет)
-    src = np.asarray(framed).astype(np.float32)
-    alpha = src[..., 3:4] / 255.0
-    pre = np.concatenate([src[..., :3] * alpha, alpha * 255.0], axis=2).astype(np.uint8)
-    small_rgba = np.asarray(
-        Image.fromarray(pre, "RGBA").resize((grid_w, grid_h), Image.Resampling.BOX)
-    ).astype(np.float32)
+    # 5) premultiplied BOX-усреднение до сетки (прозрачность не «замыливает» цвет)
+    src = np.dstack([arr, alpha]).astype(np.float32)
+    a = src[..., 3:4] / 255.0
+    pre = np.concatenate([src[..., :3] * a, a * 255.0], axis=2).astype(np.uint8)
+    small = Image.fromarray(pre, "RGBA").resize((grid_w, grid_h), Image.Resampling.BOX)
+    small_rgba = np.asarray(small).astype(np.float32)
     a_grid = small_rgba[..., 3:4]
-    solid = a_grid[..., 0] >= 96.0  # пиксель-арт: жёсткая граница, без полупрозрачных краёв
+    solid = a_grid[..., 0] >= 96.0  # жёсткая граница, без полупрозрачных краёв
     rgb_grid = np.clip(small_rgba[..., :3] * (255.0 / np.maximum(a_grid, 1.0)), 0, 255)
 
-    # 4) квантизация (прозрачные пиксели невидимы — цвет в них не важен)
-    rgb_u8 = rgb_grid.astype(np.uint8)
+    # 6) бесшовный тайл — до квантизации и дизеринга
+    if seamless != "off":
+        fill = rgb_grid[solid].mean(axis=0) if solid.any() else np.array([255.0, 255.0, 255.0])
+        rgb_grid = np.where(solid[..., None], rgb_grid, fill)
+        rgb_grid = make_seamless(rgb_grid, seamless)
+        if not solid.all():
+            weight = make_seamless(solid.astype(np.float64)[..., None], seamless)[..., 0]
+            solid = weight >= 0.5
+
+    # 7) квантизация (палитру строим только по видимым пикселям)
+    visible = rgb_grid if solid.all() else rgb_grid[solid]
+    if len(visible) == 0:
+        visible = rgb_grid
     if palette == "auto":
-        palette_colors = _kmeans_palette(rgb_u8, n_colors)
-    elif palette == "custom" and not palette_colors:
-        raise ValueError("для своей палитры не заданы цвета")
+        palette_colors = _kmeans_palette(visible[:, None, :].astype(np.uint8), n_colors)
     elif palette != "custom":
         palette_colors = FIXED_PALETTES[palette]
-    dither = dither if dither in DITHER_MODES else "off"
-    rgb_out = _apply_dither(rgb_u8, np.asarray(palette_colors, dtype=np.uint8), dither)
+    pal = np.asarray(palette_colors, dtype=np.uint8)
+    rgb_out = _apply_dither(rgb_grid.astype(np.uint8), pal, dither if dither in DITHER_MODES else "off")
 
-    # 5) обводка по границам объекта (на сетке, до увеличения)
-    if outline:
-        rgb_out = _apply_outline(rgb_out, solid)
+    # 8) обводка по силуэту объекта
+    if outline != "off":
+        if cut_bg:
+            obj = solid
+        elif mask is not None:
+            obj = _shrink_mask(~mask, (grid_w, grid_h))
+        else:
+            obj = np.ones_like(solid)
+        rgb_out = _apply_outline(rgb_out, obj, pal, outline)
 
-    # 6) сборка и увеличение NEAREST'ом в целое число раз
+    if return_grid:
+        return rgb_out, solid
+
+    # 9) сборка и увеличение NEAREST'ом в целое число раз
     scale = max(1, round(RESULT_MAX_SIDE / max(grid_w, grid_h)))
-    if solid.all():  # прозрачности нет — возвращаем обычный RGB
+    if solid.all():  # прозрачности нет — обычный RGB
         art = Image.fromarray(rgb_out, "RGB").resize(
             (grid_w * scale, grid_h * scale), Image.Resampling.NEAREST
         )
@@ -334,67 +360,162 @@ def _dilate(mask: np.ndarray) -> np.ndarray:
     return mask | grow
 
 
-def _bg_color(arr: np.ndarray) -> np.ndarray:
-    """Цвет фона — медиана четырёх углов изображения."""
-    corners = np.stack([arr[0, 0], arr[0, -1], arr[-1, 0], arr[-1, -1]]).astype(np.float64)
-    return np.median(corners, axis=0)
+def _border_color(arr: np.ndarray) -> np.ndarray:
+    """Цвет фона — медиана полосы пикселей по периметру кадра."""
+    band = max(2, min(arr.shape[:2]) // 50)
+    frame = np.concatenate([
+        arr[:band].reshape(-1, 3), arr[-band:].reshape(-1, 3),
+        arr[:, :band].reshape(-1, 3), arr[:, -band:].reshape(-1, 3),
+    ])
+    return np.median(frame, axis=0)
 
 
-_AUTO_TOLERANCE_CANDIDATES = (24, 40, 64, 96, 128)
+def _sweep_forward(seed: np.ndarray, cand: np.ndarray, step: np.ndarray) -> np.ndarray:
+    """Размножить seed вправо (по строкам): только по пикселям cand и только
+    там, где в следующий пиксель можно зайти от предыдущего (step)."""
+    width = cand.shape[1]
+    starts = cand.copy()
+    starts[:, 1:] &= ~step  # новый отрезок начинается там, откуда нельзя зайти слева
+    columns = np.arange(width, dtype=np.int32)[None, :]
+    start_at = np.maximum.accumulate(np.where(starts, columns, 0), axis=1)
+    counts = np.cumsum((seed & cand).astype(np.int32), axis=1)
+    before = np.take_along_axis(counts, np.maximum(start_at - 1, 0), axis=1)
+    before = np.where(start_at == 0, 0, before)
+    return seed | (cand & (counts - before > 0))
 
 
-def _auto_bg_tolerance(arr: np.ndarray) -> int:
-    """Подобрать порог фона автоматически (для bg_tolerance=0).
+def _sweep(seed: np.ndarray, cand: np.ndarray, step: np.ndarray, axis: int, forward: bool) -> np.ndarray:
+    """Проход по строкам (axis=1) или столбцам (axis=0) в одну сторону."""
+    if axis == 0:
+        seed, cand, step = seed.T, cand.T, step.T
+    if not forward:
+        seed, cand, step = seed[:, ::-1], cand[:, ::-1], step[:, ::-1]
+    out = _sweep_forward(seed, cand, step)
+    if not forward:
+        out = out[:, ::-1]
+    return out if axis == 1 else out.T
 
-    Перебирает кандидатов на уменьшенной копии и берёт первый, при котором
-    заливка от краёв убирает правдоподобную долю фона (5–92% кадра).
+
+def _flood(cand: np.ndarray, step_h: np.ndarray | None = None, step_v: np.ndarray | None = None,
+           max_cycles: int = 8) -> np.ndarray:
+    """Заливка от края кадра (4-связность).
+
+    step_h[y, x] / step_v[y, x] — можно ли зайти в пиксель справа / снизу
+    от (y, x); без карт шагов годится любой переход между пикселями cand.
+    Вместо волны по одному пикселю — проходы целыми отрезками по строкам и
+    столбцам: сходится за несколько циклов на любом разрешении.
     """
-    factor = max(1, max(arr.shape[:2]) // 96)
-    sub = arr[::factor, ::factor]
-    bg = _bg_color(sub)
-    dist = np.sqrt(((sub.astype(np.float64) - bg) ** 2).sum(axis=2))
-    for tol in _AUTO_TOLERANCE_CANDIDATES:
-        close = dist <= tol
-        flooded = _flood_from_border(close)
-        coverage = flooded.sum() / flooded.size
-        if 0.05 <= coverage <= 0.92:
-            return tol
-    return 64
+    if step_h is None:
+        step_h = cand[:, :-1] & cand[:, 1:]
+        step_v = cand[:-1, :] & cand[1:, :]
+    reached = np.zeros_like(cand)
+    reached[0, :] = cand[0, :]
+    reached[-1, :] = cand[-1, :]
+    reached[:, 0] |= cand[:, 0]
+    reached[:, -1] |= cand[:, -1]
+    for _ in range(max_cycles):
+        before = int(reached.sum())
+        for axis, step in ((1, step_h), (0, step_v)):
+            reached = _sweep(reached, cand, step, axis, True)
+            reached = _sweep(reached, cand, step, axis, False)
+        if int(reached.sum()) == before:
+            break
+    return reached
+
+
+# соседние пиксели «плавные», если отличаются не сильнее: градиент, тень, шум JPEG
+# проходят, текстуры (трава, кожа, ткань) и края объекта — нет
+_SMOOTH_STEP = 10.0
+_LOCAL_CAP = 200.0  # плавный переход не уводит дальше от цвета фона
+_TOLERANCES = (12, 20, 28, 36, 44, 52, 64)
+_MIN_BG_COVERAGE = 0.04
+_bg_mask_cache: "OrderedDict[tuple, tuple[np.ndarray, float]]" = OrderedDict()
+
+
+def _bg_candidate(arr: np.ndarray, bg: np.ndarray, tolerance: float):
+    """Кандидаты в фон и карты переходов для заливки.
+
+    cand — пиксели, которым вообще разрешено быть фоном: близкие к цвету фона
+    ИЛИ не слишком от него далёкие. step — в какой соседний пиксель можно зайти:
+    если он близок к цвету фона, либо переход к нему плавный (виньетка, мягкая
+    тень, шум сжатия). Край объекта — резкий скачок — переход не пропускает.
+    """
+    dist = np.sqrt(((arr - bg) ** 2).sum(axis=2))
+    close = dist <= tolerance
+    step_h = np.sqrt(((arr[:, :-1] - arr[:, 1:]) ** 2).sum(axis=2))  # (h, w-1)
+    step_v = np.sqrt(((arr[:-1, :] - arr[1:, :]) ** 2).sum(axis=2))  # (h-1, w)
+    return (
+        close | (dist <= _LOCAL_CAP),
+        close[:, 1:] | (step_h <= _SMOOTH_STEP),
+        close[1:, :] | (step_v <= _SMOOTH_STEP),
+    )
+
+
+def _background_mask(arr: np.ndarray) -> tuple[np.ndarray, float]:
+    """Маска фона кадра (True — фон) и её доля.
+
+    Фон — то, что достижимо от края кадра по фоновым пикселям. Порог схожести
+    с цветом фона подбирается: растёт, пока заливка не начинает съедать объект
+    (резкий прирост доли). Фона нет — маска пустая, доля 0. Кэш по кадру,
+    чтобы перерисовка кнопками не пересчитывала заливку.
+    """
+    key = (hash(arr.astype(np.uint8).tobytes()), arr.shape)
+    cached = _bg_mask_cache.get(key)
+    if cached is not None:
+        _bg_mask_cache.move_to_end(key)
+        return cached
+    band = max(2, min(arr.shape[:2]) // 50)
+    sides = [arr[:band].reshape(-1, 3), arr[-band:].reshape(-1, 3),
+             arr[:, :band].reshape(-1, 3), arr[:, -band:].reshape(-1, 3)]
+    medians = np.array([np.median(side, axis=0) for side in sides])
+    spread = max(np.sqrt(((medians[i] - medians[j]) ** 2).sum())
+                 for i in range(4) for j in range(i + 1, 4))
+    if spread > 100:  # периметр разноцветный — однородного фона в кадре нет
+        return np.zeros(arr.shape[:2], dtype=bool), 0.0
+    bg = _border_color(arr)
+    sub = arr[::8, ::8]
+    tolerance = _TOLERANCES[0]
+    coverage = _flood(*_bg_candidate(sub, bg, tolerance)).mean()
+    for candidate in _TOLERANCES[1:]:
+        grown = _flood(*_bg_candidate(sub, bg, candidate)).mean()
+        if grown - coverage > max(0.015, 0.08 * (1.0 - coverage)):
+            break
+        tolerance, coverage = candidate, grown
+    flooded = _flood(*_bg_candidate(arr, bg, tolerance))
+    share = float(flooded.mean())
+    if share < _MIN_BG_COVERAGE or share > 0.985:  # фона нет либо съелось всё
+        flooded = np.zeros(arr.shape[:2], dtype=bool)
+        share = 0.0
+    _bg_mask_cache[key] = (flooded, share)
+    while len(_bg_mask_cache) > 64:
+        _bg_mask_cache.popitem(last=False)
+    return flooded, share
 
 
 def _frame_image(
     img: Image.Image,
     cut_bg: bool,
-    bg_tolerance: int,
     crop_object: bool,
     padding: int,
-) -> Image.Image:
-    """Вырезать фон (flood fill от краёв) и/или кадрировать до объекта.
+    mask: np.ndarray | None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray | None]:
+    """Вырезать фон по маске и/или кадрировать до объекта.
 
-    bg_tolerance=0 — порог подбирается автоматически. Возвращает RGBA;
-    без вырезки альфа непрозрачная.
+    Возвращает (RGB, альфа, маска фона) одного размера; без вырезки альфа
+    непрозрачна. mask=None — однородного фона в кадре не нашлось.
     """
     arr = np.asarray(img.convert("RGB"))
     height, width = arr.shape[:2]
-    alpha = np.full((height, width), 255, dtype=np.uint8)
-    bg = _bg_color(arr)
-    dist = np.sqrt(((arr.astype(np.float64) - bg) ** 2).sum(axis=2))
-
-    if cut_bg:
-        tolerance = bg_tolerance if bg_tolerance and bg_tolerance > 0 else _auto_bg_tolerance(arr)
-        close = dist <= max(1, tolerance)
-        # BFS на четверти разрешения — быстро даже на 4000 px
-        flooded_q = _flood_from_border(close[::4, ::4])
-        flooded = np.repeat(np.repeat(flooded_q, 4, axis=0), 4, axis=1)[:height, :width]
-        for _ in range(3):  # догнать границы на полном разрешении
-            flooded = _dilate(flooded) & close
-        alpha = np.where(flooded, 0, 255).astype(np.uint8)
-
+    if mask is not None and cut_bg:
+        alpha = np.where(mask, 0, 255).astype(np.uint8)
+    else:
+        alpha = np.full((height, width), 255, dtype=np.uint8)
     if crop_object:
-        if cut_bg:
-            content = alpha > 0
+        if mask is not None:
+            content = ~mask
         else:
-            content = dist > UNIFORM_TRIM_TOLERANCE  # «не фон» без вырезки
+            far = np.sqrt(((arr.astype(np.float64) - _border_color(arr)) ** 2).sum(axis=2))
+            content = far > UNIFORM_TRIM_TOLERANCE
         rows = np.where(content.any(axis=1))[0]
         cols = np.where(content.any(axis=0))[0]
         if len(rows) and len(cols):
@@ -407,45 +528,74 @@ def _frame_image(
             c1 = min(width, cols[-1] + 1 + pad)
             arr = arr[r0:r1, c0:c1]
             alpha = alpha[r0:r1, c0:c1]
+            if mask is not None:
+                mask = mask[r0:r1, c0:c1]
+    return arr, alpha, mask
 
-    return Image.fromarray(np.dstack([arr, alpha]), "RGBA")
+
+def _erode4(mask: np.ndarray) -> np.ndarray:
+    """Сжать маску на 1 пиксель (за краем кадра считается «объект»)."""
+    out = mask.copy()
+    out[1:, :] &= mask[:-1, :]
+    out[:-1, :] &= mask[1:, :]
+    out[:, 1:] &= mask[:, :-1]
+    out[:, :-1] &= mask[:, 1:]
+    return out
 
 
-def _apply_outline(rgb: np.ndarray, solid: np.ndarray, threshold: int = 40) -> np.ndarray:
-    """Обводка с освещением (сел-шейдинг): верхние края объекта светлее,
-    нижние темнее, боковые — среднее. Границы с прозрачностью — тоже края."""
-    out = rgb.copy().astype(np.float64)
-    h, w = solid.shape
-    ints = rgb.astype(np.int16)
-    non_solid = ~solid
+def _shrink_mask(mask: np.ndarray, size: tuple[int, int]) -> np.ndarray:
+    """Уменьшить маску до сетки: пиксель покрыт, если занят от ~38%."""
+    small = Image.fromarray((mask * 255).astype(np.uint8), "L").resize(size, Image.Resampling.BOX)
+    return np.asarray(small) >= 96
 
-    def _dir_diff(a_sl, b_sl):
-        """Граница пикселя в направлении соседа: другой цвет или прозрачность."""
-        color_diff = np.abs(ints[a_sl] - ints[b_sl]).max(axis=2) > threshold
-        full = np.zeros_like(solid)
-        full[a_sl] = (color_diff | non_solid[b_sl]) & solid[a_sl]
-        return full
 
-    # направления срезов: для пикселя (y, x) сосед (y+dy, x+dx)
-    up = _dir_diff((slice(1, None), slice(None)), (slice(None, -1), slice(None)))
-    up[-1, :] |= solid[-1, :]  # у края кадра считаем границу
-    down = _dir_diff((slice(None, -1), slice(None)), (slice(1, None), slice(None)))
-    down[0, :] |= solid[0, :]
-    left = _dir_diff((slice(None), slice(1, None)), (slice(None), slice(None, -1)))
-    left[:, 0] |= solid[:, 0]
-    right = _dir_diff((slice(None), slice(None, -1)), (slice(None), slice(1, None)))
-    right[:, -1] |= solid[:, -1]
+_OUTLINE_WEIGHTS = np.array([0.299, 0.587, 0.114])
 
-    side_edge = solid & (left | right) & ~up & ~down
-    top_edge = solid & up & ~down
-    bottom_edge = solid & down
 
-    mult = np.ones(solid.shape, dtype=np.float64)
-    mult[side_edge] = 0.7
-    mult[top_edge] = 1.35
-    mult[bottom_edge] = 0.4  # низ приоритетнее: один множитель на пиксель
-    out = np.clip(out * mult[..., None], 0, 255)
-    return out.astype(np.uint8)
+def _apply_outline(rgb: np.ndarray, obj: np.ndarray, palette, mode: str) -> np.ndarray:
+    """Обводка по силуэту объекта, только цветами палитры.
+
+    obj — маска объекта на сетке. dark — тёмный контур в 1 пиксель по краю
+    объекта (внутренние границы цветов и край кадра не обводятся).
+    volume — тот же контур + второй ряд: свет сверху, тень снизу.
+    """
+    ring = obj & ~_erode4(obj)
+    if not ring.any():
+        return rgb
+    pal = np.asarray(palette, dtype=np.float64)
+    lum = pal @ _OUTLINE_WEIGHTS
+    out = rgb.astype(np.float64).copy()
+    darkest = int(np.argmin(lum))
+    if lum[darkest] <= 80:
+        out[ring] = pal[darkest]
+    else:  # тёмного в палитре нет — ближайший к затемнённому пикселю
+        cur = rgb[ring].astype(np.float64) * 0.45
+        out[ring] = pal[((cur[:, None, :] - pal[None, :, :]) ** 2).sum(-1).argmin(1)]
+    if mode != "volume":
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    inner = obj & ~ring
+    second = inner & ~_erode4(inner)  # ряд объекта вплотную к контуру
+    above = np.zeros_like(obj)
+    above[1:, :] = ring[:-1, :]
+    below = np.zeros_like(obj)
+    below[:-1, :] = ring[1:, :]
+    top_facing = second & above
+    bottom_facing = second & below & ~top_facing
+    side = second & ~top_facing & ~bottom_facing
+    for selection, factor, lighter in (
+        (top_facing, 1.35, True), (bottom_facing, 0.6, False), (side, 0.8, False),
+    ):
+        if not selection.any():
+            continue
+        current = rgb[selection].astype(np.float64)
+        target = current * factor
+        candidate = pal[((target[:, None, :] - pal[None, :, :]) ** 2).sum(-1).argmin(1)]
+        keep = (candidate @ _OUTLINE_WEIGHTS >= current @ _OUTLINE_WEIGHTS) if lighter else (
+            candidate @ _OUTLINE_WEIGHTS <= current @ _OUTLINE_WEIGHTS
+        )
+        out[selection] = np.where(keep[:, None], candidate, current)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 # ---------------------------------------------------------------- ассет-паки (текстуры)
@@ -479,9 +629,10 @@ def make_seamless(arr: np.ndarray, mode: str) -> np.ndarray:
         mask = np.clip(np.minimum(dy, dx), 0.0, 1.0)[..., None]
         return arr * mask + rolled * (1.0 - mask)
     if mode == "mirror":
-        quarter = arr[: height // 2, : width // 2]
-        top = np.concatenate([quarter, quarter[:, ::-1]], axis=1)
-        return np.concatenate([top, top[::-1, :]], axis=0)
+        # половины берём с запасом: центральная ось отражается сама на себя
+        quarter = arr[: math.ceil(height / 2), : math.ceil(width / 2)]
+        top = np.concatenate([quarter, quarter[:, ::-1]], axis=1)[:, :width]
+        return np.concatenate([top, top[::-1, :]], axis=0)[:height]
     if mode == "off":
         return arr
     raise ValueError(f"неизвестный режим бесшовности: {mode}")
@@ -539,12 +690,44 @@ def contact_sheet(tiles: list[np.ndarray], scale: int = 4) -> Image.Image:
     return Image.fromarray(sheet, "RGB")
 
 
+def mosaic_sheet(tiles: list[np.ndarray], per_side: int = 3,
+                 max_side: int = RESULT_MAX_SIDE, gap: int = 8) -> Image.Image:
+    """Превью пака: каждый тайл сложен мозаикой per_side×per_side — стыки
+    видны сразу, до открытия архива."""
+    count = len(tiles)
+    cols = math.ceil(math.sqrt(count))
+    rows = math.ceil(count / cols)
+    size = tiles[0].shape[0]
+    cell = max(per_side * size, min(768, (max_side - gap * (cols + 1)) // cols))
+    sheet = Image.new("RGB", (cols * cell + gap * (cols + 1), rows * cell + gap * (rows + 1)), (255, 255, 255))
+    for index, tile in enumerate(tiles):
+        rgb = tile[..., :3]
+        if tile.shape[-1] == 4:  # прозрачное кладём на белый
+            rgb = np.where(tile[..., 3:4] >= 128, rgb, 255)
+        mosaic = np.tile(rgb, (per_side, per_side, 1)).astype(np.uint8)
+        piece = Image.fromarray(mosaic, "RGB")
+        if cell >= piece.width:  # увеличение целым числом раз — пиксели ровные
+            factor = max(1, cell // piece.width)
+            piece = piece.resize((piece.width * factor, piece.height * factor), Image.Resampling.NEAREST)
+        else:
+            piece = piece.resize((cell, cell), Image.Resampling.NEAREST)
+        row, col = divmod(index, cols)
+        left = gap + col * (cell + gap) + (cell - piece.width) // 2
+        top = gap + row * (cell + gap) + (cell - piece.height) // 2
+        sheet.paste(piece, (left, top))
+    return sheet
+
+
 # ---------------------------------------------------------------- геймдев-инструменты
 
 
-def _clahe(img: Image.Image, clip: float = 3.0, tiles: int = 8) -> Image.Image:
-    """Локальный контраст (упрощённый CLAHE по яркости, билинейные LUT) —
-    спасает мелкие детали при сильном уменьшении."""
+_DETAILS_STRENGTH = 0.5  # доля локального контраста в результате (мягкий эффект)
+
+
+def _enhance_details(img: Image.Image, clip: float = 2.0, tiles: int = 8) -> Image.Image:
+    """Чёткость мелких деталей: мягкий локальный контраст по яркости
+    (упрощённый CLAHE, билинейные LUT), подмешанный к оригиналу — плоские
+    участки почти не меняются, мелкие элементы не сливаются при уменьшении."""
     arr = np.asarray(img.convert("RGB")).astype(np.float64)
     h, w, _ = arr.shape
     lum = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]) / 255.0
@@ -576,7 +759,7 @@ def _clahe(img: Image.Image, clip: float = 3.0, tiles: int = 8) -> Image.Image:
     newlum = (v00 * (1 - wy) * (1 - wx) + v01 * (1 - wy) * wx
               + v10 * wy * (1 - wx) + v11 * wy * wx)
     scale = np.where(lum > 1 / 255, newlum / np.maximum(lum, 1 / 255), 1.0)
-    out = np.clip(arr * scale[..., None], 0, 255)
+    out = np.clip(arr * (1.0 - _DETAILS_STRENGTH * (1.0 - scale[..., None])), 0, 255)
     return Image.fromarray(out.astype(np.uint8), "RGB")
 
 
@@ -755,6 +938,27 @@ def _nearest_palette(pixels: np.ndarray, palette: np.ndarray) -> np.ndarray:
     return palette[np.argmin(dist, axis=1)]
 
 
+def _render_params(settings: Settings, custom_palette: tuple | None) -> dict:
+    """Параметры make_pixel_art по настройкам — общие для результата и мозаики."""
+    return dict(
+        pixel_size=settings.pixel_size,
+        custom_grid=settings.custom_grid,
+        palette=settings.palette,
+        n_colors=settings.n_colors,
+        dither=settings.dither,
+        contrast=settings.contrast,
+        saturation=settings.saturation,
+        sharpness=settings.sharpness,
+        palette_colors=custom_palette,
+        cut_bg=settings.cut_bg,
+        crop_object=settings.crop_mode != "off",
+        padding=0 if settings.crop_mode == "fill" else 15,
+        outline=settings.outline,
+        seamless=settings.seamless,
+        details=settings.details,
+    )
+
+
 def render(
     source: bytes,
     settings: Settings,
@@ -764,28 +968,10 @@ def render(
     """Собрать PNG результата из сжатого исходника по настройкам.
 
     flatten=True (для отправки фото) — прозрачность заливается белым,
-    иначе PNG сохраняет альфу (для «📎 PNG» и стикера).
+    иначе PNG сохраняет альфу (для «PNG» и стикера).
     """
     img = Image.open(io.BytesIO(source)).convert("RGB")
-    art = make_pixel_art(
-        img,
-        pixel_size=settings.pixel_size,
-        custom_grid=settings.custom_grid,
-        palette=settings.palette,
-        n_colors=settings.n_colors,
-        dither=settings.dither,
-        enhance_details=settings.clahe,
-        contrast=settings.contrast,
-        saturation=settings.saturation,
-        sharpness=settings.sharpness,
-        palette_colors=custom_palette,
-        cut_bg=settings.cut_bg,
-        bg_tolerance=settings.bg_tolerance,
-        crop_object=settings.crop_mode != "off",
-        padding=0 if settings.crop_mode == "fill" else 15,
-        outline=settings.outline,
-        show_grid=settings.show_grid,
-    )
+    art = make_pixel_art(img, **_render_params(settings, custom_palette), show_grid=settings.show_grid)
     art = post_effects(
         art,
         crt=settings.crt,
@@ -798,6 +984,23 @@ def render(
         art = background
     buffer = io.BytesIO()
     art.save(buffer, "PNG", optimize=True)
+    return buffer.getvalue()
+
+
+def tiled_preview(source: bytes, settings: Settings, custom_palette: tuple | None = None,
+                  tiles: int = 3) -> bytes:
+    """PNG: результат, сложенный мозаикой tiles×tiles — проверка бесшовности.
+
+    Берёт ту же сетку, что и результат (без эффектов и водяного знака).
+    """
+    img = Image.open(io.BytesIO(source)).convert("RGB")
+    rgb, solid = make_pixel_art(img, **_render_params(settings, custom_palette), return_grid=True)
+    mosaic = np.tile(np.where(solid[..., None], rgb, 255).astype(np.uint8), (tiles, tiles, 1))
+    scale = max(1, RESULT_MAX_SIDE // max(mosaic.shape[:2]))
+    if scale > 1:
+        mosaic = np.repeat(np.repeat(mosaic, scale, axis=0), scale, axis=1)
+    buffer = io.BytesIO()
+    Image.fromarray(mosaic, "RGB").save(buffer, "PNG", optimize=True)
     return buffer.getvalue()
 
 

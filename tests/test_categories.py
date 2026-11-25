@@ -57,7 +57,7 @@ def test_flood_from_border_synthetic():
 
 def test_cut_background_alpha():
     art = make_pixel_art(_object_on_white(), pixel_size="huge", palette="pico8",
-                         cut_bg=True, bg_tolerance=48)
+                         cut_bg=True)
     arr = np.asarray(art)
     assert art.mode == "RGBA"
     assert arr[0, 0, 3] == 0           # угол — фон удалён
@@ -66,21 +66,40 @@ def test_cut_background_alpha():
     assert tuple(arr[h // 2, w // 2, :3]) in set(FIXED_PALETTES["pico8"])
 
 
-def test_cut_background_tolerance_changes_result():
-    # градиентный фон: низкий порог режет только светлую часть, высокий — почти весь
-    img = Image.new("RGB", (200, 200))
+def test_cut_background_auto_tolerance():
+    """Порог подбирается сам: фон с плавным градиентом вырезается целиком,
+    объект остаётся непрозрачным."""
     arr = np.zeros((200, 200, 3), dtype=np.uint8)
-    arr[..., :] = np.linspace(245, 150, 200, dtype=np.uint8)[:, None]
-    draw = ImageDraw.Draw(img)
-    arr_img = Image.fromarray(arr)
-    img.paste(arr_img, (0, 0))
-    draw.rectangle((80, 80, 120, 120), fill=(200, 30, 50))
-    a = np.asarray(make_pixel_art(img, cut_bg=True, bg_tolerance=16))
-    b = np.asarray(make_pixel_art(img, cut_bg=True, bg_tolerance=140))
-    assert a[..., 3].sum() != b[..., 3].sum()
+    arr[..., :] = np.linspace(245, 195, 200, dtype=np.uint8)[:, None]
+    img = Image.fromarray(arr, "RGB")
+    ImageDraw.Draw(img).rectangle((80, 80, 120, 120), fill=(200, 30, 50))
+    art = np.asarray(make_pixel_art(img, pixel_size="huge", cut_bg=True))
+    assert art.shape[-1] == 4 and art[0, 0, 3] == 0  # фон удалён
+    mid = art.shape[0] // 2
+    assert art[mid, mid, 3] == 255 and art[mid, mid, 0] > 150  # объект на месте
 
 
-# ------------------------------------------------------------------ кадр и объект
+def test_cut_background_ignores_busy_scene():
+    """Разноцветный периметр (пейзаж) — однородного фона нет, ничего не режем."""
+    from bot.pixelart import _background_mask
+
+    rng = np.random.RandomState(5)
+    scene = rng.randint(0, 255, (120, 160, 3)).astype(np.float64)  # шум по всему периметру
+    mask, share = _background_mask(scene)
+    assert share == 0.0 and not mask.any()
+
+
+def test_outline_follows_silhouette_only():
+    """Обводка: тёмный контур по краю объекта цветами палитры, без рамки
+    по краю кадра и без линий на внутренних границах цветов."""
+    img = _object_on_white()
+    palette = set(FIXED_PALETTES["pico8"])
+    plain = np.asarray(make_pixel_art(img, pixel_size="huge", palette="pico8", cut_bg=True))
+    dark = np.asarray(make_pixel_art(img, pixel_size="huge", palette="pico8", cut_bg=True, outline="dark"))
+    assert plain.tobytes() != dark.tobytes()
+    assert set(map(tuple, dark[..., :3].reshape(-1, 3).tolist())) <= palette  # только палитра
+    changed = (plain[..., :3] != dark[..., :3]).any(axis=2)
+    assert not changed[~plain[..., 3].astype(bool)].any()  # прозрачное не тронуто
 
 
 def test_crop_object_fills_frame():
@@ -105,8 +124,8 @@ def test_outline_changes_result():
     plain = np.asarray(make_pixel_art(_object_on_white(), palette="gameboy", cut_bg=True))
     edged = np.asarray(make_pixel_art(_object_on_white(), palette="gameboy", cut_bg=True, outline=True))
     assert plain.tobytes() != edged.tobytes()
-    # сел-шейдинг: множители 1.35 (верх) / 0.7 (бока) / 0.4 (низ), обрезка по 255
-    multipliers = (1.35, 0.7, 0.4)
+    # обводка цветами палитры: тёмный контур, множители не нужны
+    multipliers = ()
     allowed = set(FIXED_PALETTES["gameboy"]) | {
         tuple(int(min(255, c * m)) for c in col) for col in FIXED_PALETTES["gameboy"] for m in multipliers
     }
